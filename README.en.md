@@ -6,6 +6,7 @@
 
 <p align="center"><b>English</b> | <a href="README.md">中文</a></p>
 
+[![CI](https://github.com/dadahuiming/kimicode-pocket/actions/workflows/ci.yml/badge.svg)](https://github.com/dadahuiming/kimicode-pocket/actions/workflows/ci.yml)
 [![Node.js](https://img.shields.io/badge/Node.js-22%2B-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
 [![Cloudflare Tunnel](https://img.shields.io/badge/Cloudflare-Tunnel-F38020?logo=cloudflare&logoColor=white)](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
