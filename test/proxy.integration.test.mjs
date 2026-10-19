@@ -8,6 +8,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import zlib from 'node:zlib';
 import { spawn } from 'node:child_process';
 import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -29,6 +30,56 @@ function freePort() {
   });
 }
 
+/** 造一张噪声 PNG（纯色图压缩率太高，测不出降采样收益） */
+function makeTestPng(width, height) {
+  const SIG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  const table = (() => {
+    const t = new Int32Array(256);
+    for (let n = 0; n < 256; n += 1) {
+      let c = n;
+      for (let k = 0; k < 8; k += 1) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+      t[n] = c;
+    }
+    return t;
+  })();
+  const crc = (buf) => {
+    let c = 0xffffffff;
+    for (let i = 0; i < buf.length; i += 1) c = table[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+    return (c ^ 0xffffffff) >>> 0;
+  };
+  const chunk = (type, data) => {
+    const len = Buffer.alloc(4);
+    len.writeUInt32BE(data.length);
+    const typed = Buffer.concat([Buffer.from(type, 'ascii'), data]);
+    const c = Buffer.alloc(4);
+    c.writeUInt32BE(crc(typed));
+    return Buffer.concat([len, typed, c]);
+  };
+  const channels = 3;
+  const stride = width * channels;
+  const raw = Buffer.alloc((stride + 1) * height);
+  let seed = 12345;
+  for (let y = 0; y < height; y += 1) {
+    const o = y * (stride + 1);
+    raw[o] = 0;
+    for (let x = 0; x < stride; x += 1) {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      raw[o + 1 + x] = (seed + y * 3 + x * 2) & 0xff;
+    }
+  }
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 2;
+  return Buffer.concat([
+    SIG,
+    chunk('IHDR', ihdr),
+    chunk('IDAT', zlib.deflateSync(raw, { level: 6 })),
+    chunk('IEND', Buffer.alloc(0)),
+  ]);
+}
+
 /** 假 Desktop：覆盖探活、回显头、大 JSON、WebSocket */
 function startFakeDesktop() {
   return new Promise((resolve) => {
@@ -46,6 +97,49 @@ function startFakeDesktop() {
       if (req.url === '/big.json') {
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ pad: 'x'.repeat(200_000) }));
+        return;
+      }
+      // 「没有截图的长会话」：真实场景里纯文本对话就是这样。
+      // 瘦身逻辑会返回 null（无可压内容），此时必须原样透传 —— 曾经这里
+      // 被当成失败返回 502，导致这类会话在手机上完全打不开。
+      if (req.url.includes('/sessions/plain/transcript')) {
+        const items = [];
+        for (let i = 0; i < 40; i += 1) {
+          items.push({
+            stepId: `s${i}`,
+            frames: [{ kind: 'thinking', text: '思考'.repeat(3000) }],
+          });
+        }
+        res.writeHead(200, {
+          'content-type': 'application/json; charset=utf-8',
+          'content-length': String(Buffer.byteLength(JSON.stringify({ data: { items } }))),
+        });
+        res.end(JSON.stringify({ data: { items } }));
+        return;
+      }
+      // 「带截图的长会话」：应触发降采样
+      if (req.url.includes('/sessions/pics/transcript')) {
+        const png = makeTestPng(1600, 1000);
+        const body = JSON.stringify({
+          data: {
+            items: [
+              {
+                stepId: 's0',
+                frames: [
+                  {
+                    kind: 'tool',
+                    output: [{ type: 'image_url', imageUrl: { url: `data:image/png;base64,${png.toString('base64')}` } }],
+                  },
+                ],
+              },
+            ],
+          },
+        });
+        res.writeHead(200, {
+          'content-type': 'application/json; charset=utf-8',
+          'content-length': String(Buffer.byteLength(body)),
+        });
+        res.end(body);
         return;
       }
       if (req.url === '/sse') {
@@ -430,4 +524,40 @@ test('开启 PIN 后：页面跳登录、API 返回 401 JSON、配对可免 PIN'
   } finally {
     p.stop();
   }
+});
+
+// ---------------------------------------------------------------- 瘦身回归
+//
+// 这一组防的是 v1.5.0 那个 502 事故：
+// 「没有截图的会话」走瘦身分支时 trimJsonBuffer 返回 null（无可压内容），
+// 旧代码把它当失败 throw，导致整条 transcript 变 502 Bad Gateway，
+// 手机端看到的是 Cloudflare 错误页而不是对话内容。
+
+test('瘦身：无截图的长会话必须 200 原样透传，不能 502', async () => {
+  const r = await fetch(`${proxy.base}/api/v1/sessions/plain/transcript?agent_id=main&page_size=10`);
+  assert.equal(r.status, 200, '没有可压内容时应原样透传，绝不能 502');
+
+  // 不应带 trimmed 标记（因为什么都没改）
+  assert.equal(r.headers.get('x-pocket-trimmed'), null);
+
+  // 内容必须是完整 JSON，且文字原样
+  const body = await r.json();
+  assert.ok(Array.isArray(body.data.items));
+  assert.equal(body.data.items.length, 40);
+  assert.equal(body.data.items[0].frames[0].text, '思考'.repeat(3000));
+});
+
+test('瘦身：带截图的会话 200 且标记 trimmed，文字不变', async () => {
+  const r = await fetch(`${proxy.base}/api/v1/sessions/pics/transcript?agent_id=main&page_size=10`);
+  assert.equal(r.status, 200);
+  assert.equal(r.headers.get('x-pocket-trimmed'), '1');
+
+  const body = await r.json();
+  assert.ok(Array.isArray(body.data.items));
+  const url = body.data.items[0].frames[0].output[0].imageUrl.url;
+  assert.match(url, /^data:image\/png;base64,/);
+
+  // 降采样后应明显小于原图（1600x1000 → 533x333 左右）
+  const outLen = Buffer.from(url.split(',')[1], 'base64').length;
+  assert.ok(outLen < 900_000, `压缩后应明显变小，实际 ${outLen}`);
 });

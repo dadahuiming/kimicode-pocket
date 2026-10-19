@@ -1,6 +1,6 @@
 {
   "name": "kimicode-pocket",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "description": "Expose Kimi Code Desktop's web UI to your phone with a fixed-port reverse proxy: dynamic port discovery, Host/Origin rewrite, WebSocket passthrough, optional PIN, one-time pairing links and local QR codes. Zero runtime dependencies.",
   "type": "module",
   "bin": {

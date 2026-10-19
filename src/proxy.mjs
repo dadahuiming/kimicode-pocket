@@ -56,7 +56,7 @@ const CREDENTIAL_TTL_DAYS = 7;
 const MAX_LOG_BYTES = 5 * 1024 * 1024;
 const LOG_FLUSH_MS = 500;
 const LOG_FLUSH_LINES = 64;
-const VERSION = '1.5.0';
+const VERSION = '1.5.1';
 
 const HELP = `KimiCode Pocket ${VERSION}
 
@@ -873,16 +873,38 @@ const server = http.createServer(async (req, res) => {
       // 这里只降图片分辨率，文字一个字符都不动；压缩跑在 worker 线程。
       if (shouldTrim(req, proxyRes, cfg.trim)) {
         void (async () => {
+          // 在 try 外声明：catch 里要用它做降级透传
+          const chunks = [];
+          let rawBody = null;
+          let rawLen = 0;
           try {
-            const chunks = [];
-            let size = 0;
             for await (const chunk of proxyRes) {
-              size += chunk.length;
-              if (size > cfg.trim.maxBufferBytes) throw new Error('trim buffer overflow');
+              rawLen += chunk.length;
+              if (rawLen > cfg.trim.maxBufferBytes) {
+                // 太大的不缓冲，直接放弃瘦身并把已读的部分算进去
+                rawBody = null;
+                throw new Error('trim buffer overflow');
+              }
               chunks.push(chunk);
             }
-            const result = await trimJsonBuffer(Buffer.concat(chunks), cfg.trim);
-            if (!result) throw new Error('nothing to shrink');
+            const raw = Buffer.concat(chunks);
+            rawBody = raw;
+            const result = await trimJsonBuffer(raw, cfg.trim);
+
+            // null = 「这条响应里没有可压的截图」或「不是合法 JSON」。
+            // 这是正常情况，**必须原样透传**，不能当失败。
+            // 曾经这里写成 throw new Error('nothing to shrink')，导致所有
+            // 「没有截图的长会话」（比如纯文本对话）一律 502 Bad Gateway ——
+            // 用户手机上看到的就是 Cloudflare 的错误页。
+            if (!result) {
+              const passthrough = { ...hdrs };
+              delete passthrough['content-length'];
+              passthrough['content-length'] = String(raw.length);
+              res.writeHead(proxyRes.statusCode ?? 200, passthrough);
+              res.end(raw);
+              logAccess(req, res, proxyRes.statusCode ?? 200, startedAt, raw.length);
+              return;
+            }
 
             const body = result.buffer;
             const out = { ...hdrs };
@@ -921,15 +943,27 @@ const server = http.createServer(async (req, res) => {
             }
             logAccess(req, res, proxyRes.statusCode ?? 502, startedAt, body.length);
           } catch (e) {
-            // 裁剪失败必须让请求有明确结局，不能静默挂住
-            log(`trim failed ${pathname}: ${e.message}`);
+            // 瘦身失败**不能拖垮请求**：只要上游数据已经完整读到，就原样透传。
+            // 瘦身是锦上添花，不是必需品 —— 宁可慢一点（手机可能超时），
+            // 也不要直接 502 让整个会话打不开。
+            log(`瘦身跳过 ${pathname}: ${e.message}`);
             if (!res.headersSent) {
-              res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' });
-              res.end(`响应过大且裁剪失败: ${e.message}`);
+              if (rawLen > 0 && rawBody) {
+                res.writeHead(proxyRes.statusCode ?? 200, {
+                  ...hdrs,
+                  'content-length': String(rawBody.length),
+                });
+                res.end(rawBody);
+                logAccess(req, res, proxyRes.statusCode ?? 200, startedAt, rawBody.length);
+              } else {
+                // 连数据都没拿到（缓冲溢出等），只能报错
+                res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' });
+                res.end(`响应过大且无法处理: ${e.message}`);
+                logAccess(req, res, 502, startedAt);
+              }
             } else {
               res.end();
             }
-            logAccess(req, res, 502, startedAt);
           }
         })();
         return;

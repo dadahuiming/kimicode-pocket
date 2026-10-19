@@ -11,7 +11,7 @@
 [![Cloudflare Tunnel](https://img.shields.io/badge/Cloudflare-Tunnel-F38020?logo=cloudflare&logoColor=white)](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-0078D6)](#platform-parity)
-[![Tests](https://img.shields.io/badge/tests-133%20passing-brightgreen)](#development--testing)
+[![Tests](https://img.shields.io/badge/tests-135%20passing-brightgreen)](#development--testing)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)](package.json)
 
 </div>
@@ -104,7 +104,7 @@ loopback on both HTTP and WebSocket, and relays everything.
 | **Zero dependencies** | Node built-ins only — you don't even need `npm install` |
 | **Doesn't dirty the repo** | Logs and pairing artefacts go to the platform state directory; `git status` stays clean |
 | **Cross-platform** | Proxy core is identical on all three platforms; only the daemon scripts differ |
-| **Testable** | 133 tests, including process-level integration tests; CI covers 3 OS × 2 Node versions |
+| **Testable** | 135 tests, including process-level integration tests; CI covers 3 OS × 2 Node versions |
 
 ---
 
@@ -699,7 +699,7 @@ built-ins). What differs is daemonisation and paths.
 | Run 24/7 | `scripts/watchdog.ps1` + `.vbs` | `scripts/watchdog.sh` or systemd / launchd | ✅ long-running on Windows |
 | Stop | `scripts/stop.ps1` | `scripts/stop.sh` | ✅ tested on Windows |
 | Tunnel service | `scripts/tunnel-service.ps1` | `scripts/tunnel-service.sh` | Windows `status`/`check` tested; `harden`/`watch` need admin; *nix untested |
-| Tests | `npm test` | `npm test` | ✅ 133/133 on Windows; CI covers all three |
+| Tests | `npm test` | `npm test` | ✅ 135/135 on Windows; CI covers all three |
 
 > ### ⚠️ About verification status (please read)
 >
@@ -1612,7 +1612,7 @@ See [docs/how-it-works.md](docs/how-it-works.md) for the long version.
 # zero dependencies, no npm install required
 node src/proxy.mjs            # run
 npm run check                 # syntax check (all modules)
-npm test                      # 133 tests
+npm test                      # 135 tests
 ```
 
 Two layers of tests:

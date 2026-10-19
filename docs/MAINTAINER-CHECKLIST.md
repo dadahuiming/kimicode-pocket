@@ -86,7 +86,7 @@ git ls-files -s scripts/*.sh     # 期望 mode 是 100755
 
 ```bash
 npm run check        # 全部模块语法检查
-npm test             # 133 个用例，必须全绿
+npm test             # 135 个用例，必须全绿
 ```
 
 - [ ] `npm test` 全绿

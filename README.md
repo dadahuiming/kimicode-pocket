@@ -11,7 +11,7 @@
 [![Cloudflare Tunnel](https://img.shields.io/badge/Cloudflare-Tunnel-F38020?logo=cloudflare&logoColor=white)](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-0078D6)](#平台适配)
-[![Tests](https://img.shields.io/badge/tests-133%20passing-brightgreen)](#开发与测试)
+[![Tests](https://img.shields.io/badge/tests-135%20passing-brightgreen)](#开发与测试)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)](package.json)
 
 </div>
@@ -108,7 +108,7 @@ Cloudflare 隧道 ──────► proxy.mjs (固定端口 50980) ───
 | **零依赖** | 只用 Node 内置模块，`npm install` 都不需要 |
 | **不脏仓库** | 日志与配对产物一律落在平台状态目录，跑完 `git status` 依然干净 |
 | **跨平台** | 核心代理三平台通用；常驻脚本按平台提供 |
-| **可测** | 133 个用例（含进程级集成测试），CI 覆盖三平台 × 两个 Node 版本 |
+| **可测** | 135 个用例（含进程级集成测试），CI 覆盖三平台 × 两个 Node 版本 |
 
 ---
 
@@ -725,13 +725,13 @@ Desktop 用 `KIMI_CODE_HOME ?? os.homedir()/.kimi-code` 推导，**三平台同�
 | 常驻 | `scripts/watchdog.ps1` + `.vbs` | `scripts/watchdog.sh` 或 systemd / launchd | ✅ Windows 有长期运行痕迹 |
 | 停止 | `scripts/stop.ps1` | `scripts/stop.sh` | ✅ Windows 实测 |
 | 隧道服务管理 | `scripts/tunnel-service.ps1` | `scripts/tunnel-service.sh` | Windows `status`/`check` 实测；`harden`/`watch` 需管理员；*nix 未实测 |
-| 测试 | `npm test` | `npm test` | ✅ Windows 实测 133/133；CI 覆盖三平台 |
+| 测试 | `npm test` | `npm test` | ✅ Windows 实测 135/135；CI 覆盖三平台 |
 
 > ### ⚠️ 关于脚本验证状态（请先读）
 >
 > **`src/proxy.mjs` 是核心，三平台通用**，其中的转发逻辑（端口发现、Host/Origin 改写、
 > WebSocket 透传）来自**已在生产长期运行的实现**；本次新增的能力
-> （配对、PIN、压缩、限速、本机判定、配对状态回显）已有 133 个自动化测试覆盖，其中包含真实拉起进程的集成测试（假 Desktop 全链路 + CLI 入口）。
+> （配对、PIN、压缩、限速、本机判定、配对状态回显）已有 135 个自动化测试覆盖，其中包含真实拉起进程的集成测试（假 Desktop 全链路 + CLI 入口）。
 >
 > 但要说清楚：**`scripts/*.sh` 三个 shell 脚本只在 Git Bash 做过 `bash -n` 语法校验，
 > 未在真实 macOS / Linux 上端到端跑通。** `start-tunnel.ps1` 是重写过的版本，
@@ -1809,7 +1809,7 @@ kimicode-pocket/
 # 零依赖，不需要 npm install
 node src/proxy.mjs            # 启动
 npm run check                 # 语法检查（全部模块）
-npm test                      # 133 个用例
+npm test                      # 135 个用例
 ```
 
 测试分两层：
