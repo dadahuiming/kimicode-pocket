@@ -1,0 +1,123 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }} / node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node: ['22', '24']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      # 本项目零运行时依赖，不需要 npm install
+      - name: 语法检查
+        run: npm run check
+
+      - name: 单元 + 集成测试
+        run: npm test
+        env:
+          POCKET_ACCESS_LOG: '0'
+
+  shell:
+    name: shell / powershell 静态检查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ShellCheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          shellcheck --version
+          # 只报 error 级别以上，避免风格问题阻塞
+          shellcheck -S error scripts/*.sh
+
+  powershell:
+    name: PowerShell 语法解析
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 解析所有 .ps1（不执行）
+        shell: pwsh
+        run: |
+          $failed = $false
+          Get-ChildItem scripts/*.ps1 | ForEach-Object {
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) {
+              $failed = $true
+              Write-Host "::error file=$($_.FullName)::$($errors[0].Message)"
+              $errors | ForEach-Object { Write-Host "  $($_.Message) @ line $($_.Extent.StartLineNumber)" }
+            } else {
+              Write-Host "OK  $($_.Name)"
+            }
+          }
+          if ($failed) { exit 1 }
+
+  desensitize:
+    name: 脱敏闸门
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 禁止提交凭证 / 内网 IP / 本机路径
+        run: |
+          set -uo pipefail
+          fail=0
+          scan() {
+            grep -rInE "$1" . \
+              --exclude-dir=.git --exclude-dir=.github --exclude-dir=node_modules \
+              --include='*.md' --include='*.mjs' --include='*.json' \
+              --include='*.ps1' --include='*.sh' --include='*.vbs' --include='*.yml'
+          }
+          echo "--- 凭证 ---"
+          if scan '(ag|sk|ms)-[A-Za-z0-9]{20,}'; then echo "::error::发现疑似真实 API Key"; fail=1; fi
+          echo "--- 内网 IP ---"
+          if scan '(^|[^0-9])(192\.168|10\.[0-9]+\.[0-9]+|172\.(1[6-9]|2[0-9]|3[01]))\.[0-9]+'; then
+            echo "::error::发现内网 IP"; fail=1
+          fi
+          echo "--- 本机绝对路径 ---"
+          # 只拦「带真实用户名」的路径；文档里的 C:\Users\<你> 这种占位符放行
+          if scan '[A-Za-z]:\\+Users\\+[A-Za-z0-9_.-]'; then
+            echo "::error::发现本机用户目录绝对路径"; fail=1
+          fi
+          if scan '/home/[a-z][a-z0-9_-]{2,}/'; then
+            echo "::error::发现 Linux 真实家目录路径"; fail=1
+          fi
+          echo "--- 真实域名 ---"
+          if scan 'trycloudflare\.com/[a-z]{4,}-[a-z]{4,}-[a-z]{4,}'; then
+            echo "::error::发现疑似真实隧道域名"; fail=1
+          fi
+          # 不在这里泛化匹配「任意域名」：vendor 域名（shields.io / apple.com /
+          # cloudflareaccess.com…）和 `cfg.compress` 这类误报会把闸门变成噪音。
+          # 自己的域名请按 MAINTAINER-CHECKLIST 里的命令人工核一遍。
+          echo "--- 身份信息 ---"
+          if scan '\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b'; then
+            echo "::error::发现 UUID（可能是隧道/账号 ID）"; fail=1
+          fi
+          if scan '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.(com|cn|net|org)'; then
+            echo "::error::发现邮箱地址"; fail=1
+          fi
+          echo "--- 打包元数据占位符 ---"
+          if grep -q 'github.com/OWNER/' package.json; then
+            echo "::warning::package.json 里仍是 OWNER 占位符，发布前记得替换"
+          fi
+          if [ "$fail" -ne 0 ]; then exit 1; fi
+          echo "脱敏闸门通过"

@@ -1,0 +1,38 @@
+# 依赖与产物
+node_modules/
+.logs/
+*.log
+proxy.out
+proxy.err
+watchdog.log
+
+# 隧道/配对产物（含真实 token，绝不可提交）
+pair-url.txt
+pair-qr.png
+pid.txt
+*.pid
+
+# 截图（按需保留 docs/images 下的精选图，其余忽略）
+shot-*.png
+screenshots-raw/
+
+# 系统与编辑器
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
+*~
+
+# 本地环境
+.env
+.env.*
+!.env.example
+
+# macOS
+._*
+.AppleDouble
+
+# 临时
+*.tmp
