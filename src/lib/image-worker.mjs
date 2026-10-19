@@ -20,3 +20,27 @@ parentPort.on('message', (msg) => {
     parentPort.postMessage({ id, ok: false, error: String(err && err.message ? err.message : err) });
   }
 });
+
+// 收到关闭信号就退出。
+// 注意不能靠「parentPort 的 message 监听自动让 worker 存活」这一点：
+// 一旦主线程忘了 terminate，worker 会一直挂着，测试进程退不出去
+// （macOS + Node 22 上实测卡死 6 分钟以上）。
+parentPort.on('close', () => {
+  process.exit(0);
+});
+
+// 兜底：空闲超过 30 秒自行退出。
+// 主线程的 worker 是 ref 住的，正常情况会主动 terminate；
+// 万一某条路径漏了（异常、测试提前结束），这个定时器保证进程能退出去。
+// 池子发现 worker 没了会在下次派活时重建，功能不受影响。
+let idleTimer = setTimeout(() => process.exit(0), 30000);
+idleTimer.unref?.();
+
+parentPort.on('message', () => {
+  // 每收到一个任务就重置空闲计时
+  clearTimeout(idleTimer);
+  idleTimer = setTimeout(() => process.exit(0), 30000);
+  idleTimer.unref?.();
+});
+
+

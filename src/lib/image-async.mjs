@@ -217,7 +217,16 @@ export async function drain() {
 export async function shutdownWorkers() {
   await drain();
   const all = pool.splice(0, pool.length);
-  await Promise.all(all.map((s) => s.worker.terminate().catch(() => {})));
+  // terminate() 在 macOS 上偶发挂起（worker 正卡在 zlib 里时），
+  // 所以每个都套一层超时：到点就不等了，反正进程要退出了。
+  await Promise.all(
+    all.map((s) =>
+      Promise.race([
+        s.worker.terminate().catch(() => {}),
+        new Promise((r) => setTimeout(r, 2000).unref?.()),
+      ]),
+    ),
+  );
 }
 
 /** 诊断信息 */
