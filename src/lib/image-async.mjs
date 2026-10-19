@@ -61,7 +61,7 @@ function cachePut(key, value) {
 
 function spawn() {
   const worker = new Worker(WORKER_PATH);
-  const slot = { worker, busy: false };
+  const slot = { worker, busy: false, unrefed: false };
   worker.on('message', (msg) => {
     const job = worker.__current;
     worker.__current = null;
@@ -70,6 +70,7 @@ function spawn() {
       clearTimeout(job.timer);
       job.resolve(msg);
     }
+    releaseSlotRef(slot);
     pump();
   });
   const fail = (err) => {
@@ -93,7 +94,13 @@ function spawn() {
   worker.on('exit', (code) => {
     if (code !== 0 && worker.__current) fail(`worker exit ${code}`);
   });
+  // 注意：**不能无条件 unref()**。
+  // Node 22 的 test runner 在「事件循环里只剩 unref 的 worker」时会判定
+  // 「Promise resolution is still pending but the event loop has already resolved」，
+  // 直接把还在等的 await 判成失败（Node 24 行为宽松些，所以只在 22 上炸）。
+  // 策略：空闲时 unref（不阻止进程退出），派活时 ref（保证 Promise 能等到结果）。
   worker.unref();
+  slot.unrefed = true;
   return slot;
 }
 
@@ -104,18 +111,32 @@ function pump() {
     const job = queue.shift();
     slot.busy = true;
     slot.worker.__current = job;
+    // 派活期间必须 ref，否则 Node 22 会认为事件循环已空、把 await 判失败
+    if (slot.unrefed) {
+      slot.worker.ref();
+      slot.unrefed = false;
+    }
     job.timer = setTimeout(() => {
       // 单张图超过 20 秒视为卡死，放弃并降级
       const cur = slot.worker.__current;
       if (cur === job) {
         slot.worker.__current = null;
         slot.busy = false;
+        releaseSlotRef(slot);
         job.resolve({ ok: false, error: 'timeout' });
         pump();
       }
     }, 20000);
     job.timer.unref?.();
     slot.worker.postMessage({ id: job.id, url: job.url, opts: job.opts });
+  }
+}
+
+/** 一个 slot 空下来了：重新 unref，免得它阻止进程退出 */
+function releaseSlotRef(slot) {
+  if (!slot.unrefed) {
+    slot.worker.unref();
+    slot.unrefed = true;
   }
 }
 
@@ -175,8 +196,26 @@ export function clearAsyncCaches() {
   inflight = new Map();
 }
 
+/**
+ * 等待当前所有在跑/排队的任务结束。
+ *
+ * Node 22 的 test runner 比 24 严格：如果它认为事件循环空了而 Promise 还在等，
+ * 会直接判 `Promise resolution is still pending`。收尾时先把这个等干净。
+ */
+export async function drain() {
+  while (queue.length > 0 || pool.some((s) => s.busy) || inflight.size > 0) {
+    await Promise.all([...inflight.values()].map((p) => p.catch(() => {})));
+    if (queue.length > 0 || pool.some((s) => s.busy)) {
+      await new Promise((r) => setTimeout(r, 20));
+    } else {
+      break;
+    }
+  }
+}
+
 /** 关掉所有 worker（进程退出/测试收尾用） */
 export async function shutdownWorkers() {
+  await drain();
   const all = pool.splice(0, pool.length);
   await Promise.all(all.map((s) => s.worker.terminate().catch(() => {})));
 }
