@@ -1,270 +1,406 @@
-import { test } from 'node:test';
+import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
+import zlib from 'node:zlib';
 
-import { shouldTrim, trimJsonBuffer } from '../src/lib/trim.mjs';
+import { shouldTrim, trimJsonBuffer, formatStats, clearCaches, shutdown, cacheStats } from '../src/lib/trim.mjs';
+import { decodePng, downscale, encodePng, shrinkPngDataUrl } from '../src/lib/image.mjs';
 import { loadConfig } from '../src/lib/config.mjs';
 
-// 默认裁剪配置（与线上默认值一致）
 const trimCfg = loadConfig({}).trim;
 
-/** 造一个「像 transcript」的响应头 */
+after(async () => {
+  await shutdown();
+});
+
+/** 造一个「像 messages」的响应头 */
 function jsonHeaders(len) {
   return { 'content-type': 'application/json; charset=utf-8', 'content-length': String(len) };
 }
 
-/** 造一条带 frames 的 transcript（模拟 Desktop 的真实形状） */
-function makeTranscript({ turns = 1, stepsPerTurn = 2, outputChars = 50000 } = {}) {
-  const items = [];
-  for (let t = 0; t < turns; t += 1) {
-    const steps = [];
-    for (let s = 0; s < stepsPerTurn; s += 1) {
-      steps.push({
-        kind: 'step',
-        stepId: `t${t}.${s}`,
-        turnId: `t${t}`,
-        ordinal: s,
-        state: 'done',
-        startedAt: 1,
-        endedAt: 2,
-        usage: { input: 1, output: 2 },
-        finishReason: 'stop',
-        llmTiming: { ttftMs: 10 },
-        frames: [
-          { kind: 'thinking', frameId: `t${t}.${s}.f0`, text: '想一下' },
-          {
-            kind: 'tool',
-            frameId: `t${t}.${s}.f1`,
-            toolCallId: `call-${t}-${s}`,
-            name: 'Read',
-            state: 'done',
-            input: { path: '/tmp/x' },
-            inputText: '{"path":"/tmp/x"}',
-            output: 'X'.repeat(outputChars),
-          },
-        ],
-      });
-    }
-    items.push({
-      kind: 'turn',
-      turnId: `t${t}`,
-      triggerPromptId: `p${t}`,
-      ordinal: t,
-      state: 'done',
-      origin: { kind: 'user' },
-      prompt: { text: '你好' },
-      startedAt: 1,
-      steps,
-    });
+// ---------------------------------------------------------------- 工具：造 PNG
+
+const SIG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+const CRC_TABLE = (() => {
+  const t = new Int32Array(256);
+  for (let n = 0; n < 256; n += 1) {
+    let c = n;
+    for (let k = 0; k < 8; k += 1) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    t[n] = c;
   }
-  return { code: 0, msg: 'success', data: { agent_id: 'main', items, has_more: false } };
+  return t;
+})();
+function crc32(buf) {
+  let c = 0xffffffff;
+  for (let i = 0; i < buf.length; i += 1) c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+function chunk(type, data) {
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(data.length);
+  const typed = Buffer.concat([Buffer.from(type, 'ascii'), data]);
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE(crc32(typed));
+  return Buffer.concat([len, typed, crc]);
 }
 
-const req = (url, method = 'GET') => ({ url, method });
-const ok = { statusCode: 200 };
+/**
+ * 造一张「噪声感」的 PNG（纯色图压缩率太高，测不出降采样收益）。
+ */
+function makePng(width, height, { channels = 3 } = {}) {
+  const colorType = { 1: 0, 3: 2, 4: 6 }[channels];
+  const stride = width * channels;
+  const raw = Buffer.alloc((stride + 1) * height);
+  let seed = 12345;
+  const rnd = () => {
+    seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+    return seed & 0xff;
+  };
+  for (let y = 0; y < height; y += 1) {
+    const o = y * (stride + 1);
+    raw[o] = 0; // None 滤波，保留噪声
+    for (let x = 0; x < stride; x += 1) {
+      raw[o + 1 + x] = (rnd() + y * 3 + x * 2) & 0xff;
+    }
+  }
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8;
+  ihdr[9] = colorType;
+  return Buffer.concat([
+    SIG,
+    chunk('IHDR', ihdr),
+    chunk('IDAT', zlib.deflateSync(raw, { level: 6 })),
+    chunk('IEND', Buffer.alloc(0)),
+  ]);
+}
 
-// ---- shouldTrim：该不该处理 ------------------------------------------------
+function pngDataUrl(width, height, opts) {
+  return `data:image/png;base64,${makePng(width, height, opts).toString('base64')}`;
+}
 
-test('shouldTrim：巨大的 transcript 响应被选中', () => {
-  const len = 5 * 1024 * 1024;
-  assert.equal(shouldTrim(req('/api/v1/sessions/s1/transcript?agent_id=main'), { headers: jsonHeaders(len) }, trimCfg), true);
+/** 造一条带截图的 messages 响应 */
+function makeMessagesWithImages({ textLen = 2000, images = 2, w = 800, h = 500 } = {}) {
+  const items = [];
+  for (let i = 0; i < images; i += 1) {
+    items.push({
+      id: `tool_${i}`,
+      role: 'tool',
+      content: [
+        {
+          type: 'tool_result',
+          output: [
+            { type: 'image_url', imageUrl: { url: pngDataUrl(w, h) } },
+            { type: 'text', text: '截图已保存' },
+          ],
+        },
+      ],
+    });
+  }
+  items.push({
+    id: 'assistant_0',
+    role: 'assistant',
+    content: [{ type: 'text', text: 'A'.repeat(textLen) }],
+  });
+  return { code: 0, msg: 'success', data: { items } };
+}
+
+// ---------------------------------------------------------------- shouldTrim
+
+test('shouldTrim：非 JSON 直接放过', () => {
+  const req = { method: 'GET', url: '/api/v1/sessions/x/messages' };
+  const res = { headers: { 'content-type': 'text/html', 'content-length': '999999' } };
+  assert.equal(shouldTrim(req, res, trimCfg), false);
 });
 
-test('shouldTrim：messages 也在生效路径内', () => {
-  const len = 5 * 1024 * 1024;
-  assert.equal(shouldTrim(req('/api/v1/sessions/s1/messages?page_size=50'), { headers: jsonHeaders(len) }, trimCfg), true);
+test('shouldTrim：上游已压缩的不处理', () => {
+  const req = { method: 'GET', url: '/api/v1/sessions/x/messages' };
+  const res = {
+    headers: { 'content-type': 'application/json', 'content-length': '999999', 'content-encoding': 'gzip' },
+  };
+  assert.equal(shouldTrim(req, res, trimCfg), false);
 });
 
-test('shouldTrim：小响应放过，不值得为几 KB 花 CPU', () => {
-  const len = 8 * 1024; // 8KB < minBytes(256KB)
-  assert.equal(shouldTrim(req('/api/v1/sessions/s1/transcript'), { headers: jsonHeaders(len) }, trimCfg), false);
+test('shouldTrim：小于 minBytes 不处理', () => {
+  const req = { method: 'GET', url: '/api/v1/sessions/x/messages' };
+  const res = { headers: jsonHeaders(1000) };
+  assert.equal(shouldTrim(req, res, trimCfg), false);
 });
 
-test('shouldTrim：非 JSON（SSE / 静态资源）一律放过', () => {
-  const len = 5 * 1024 * 1024;
-  const sse = { headers: { 'content-type': 'text/event-stream', 'content-length': String(len) } };
-  assert.equal(shouldTrim(req('/api/v1/sessions/s1/transcript'), sse, trimCfg), false);
-
-  const js = { headers: { 'content-type': 'text/javascript', 'content-length': String(len) } };
-  assert.equal(shouldTrim(req('/assets/main.js'), js, trimCfg), false);
+test('shouldTrim：无 content-length 视为流式，放过', () => {
+  const req = { method: 'GET', url: '/api/v1/sessions/x/messages' };
+  const res = { headers: { 'content-type': 'application/json' } };
+  assert.equal(shouldTrim(req, res, trimCfg), false);
 });
 
-test('shouldTrim：已压缩的上游响应不碰（无法在压缩流上做 JSON 处理）', () => {
-  const h = { ...jsonHeaders(5 * 1024 * 1024), 'content-encoding': 'br' };
-  assert.equal(shouldTrim(req('/api/v1/sessions/s1/transcript'), { headers: h }, trimCfg), false);
+test('shouldTrim：超过 maxBufferBytes 放过（保护内存）', () => {
+  const req = { method: 'GET', url: '/api/v1/sessions/x/messages' };
+  const res = { headers: jsonHeaders(trimCfg.maxBufferBytes + 1) };
+  assert.equal(shouldTrim(req, res, trimCfg), false);
 });
 
-test('shouldTrim：路径不匹配（会话列表、status）不处理', () => {
-  const len = 5 * 1024 * 1024;
-  for (const p of ['/api/v2/sessions?page_size=10', '/api/v1/sessions/s1/status', '/api/v1/models']) {
-    assert.equal(shouldTrim(req(p), { headers: jsonHeaders(len) }, trimCfg), false, p);
+test('shouldTrim：HEAD 请求放过', () => {
+  const req = { method: 'HEAD', url: '/api/v1/sessions/x/messages' };
+  const res = { headers: jsonHeaders(999999) };
+  assert.equal(shouldTrim(req, res, trimCfg), false);
+});
+
+test('shouldTrim：只对配置的路径生效', () => {
+  const res = { headers: jsonHeaders(999999) };
+  const hit = { method: 'GET', url: '/api/v1/sessions/x/messages' };
+  const miss = { method: 'GET', url: '/api/v1/sessions/x/something-else' };
+  assert.equal(shouldTrim(hit, res, trimCfg), true);
+  assert.equal(shouldTrim(miss, res, trimCfg), false);
+});
+
+test('shouldTrim：开关关闭时一律不处理', () => {
+  const req = { method: 'GET', url: '/api/v1/sessions/x/messages' };
+  const res = { headers: jsonHeaders(999999) };
+  assert.equal(shouldTrim(req, res, { ...trimCfg, enabled: false }), false);
+});
+
+// ---------------------------------------------------------------- 核心：文字不动
+
+test('trimJsonBuffer：没有任何图片时返回 null（不改动）', async () => {
+  const body = JSON.stringify({ code: 0, data: { items: [{ content: [{ type: 'text', text: 'x'.repeat(50000) }] }] } });
+  const res = await trimJsonBuffer(Buffer.from(body), trimCfg);
+  assert.equal(res, null, '没有图片就不该动它');
+});
+
+test('trimJsonBuffer：超长正文一个字符都不截断', async () => {
+  const longText = '这是一段很长的正文。'.repeat(20000); // 20 万字
+  const body = JSON.stringify({
+    code: 0,
+    data: { items: [{ content: [{ type: 'text', text: longText }] }] },
+  });
+  // 没有图 → 不动
+  assert.equal(await trimJsonBuffer(Buffer.from(body), trimCfg), null);
+
+  // 混入一张大图后仍然不动正文
+  const withImg = JSON.stringify({
+    code: 0,
+    data: {
+      items: [
+        { content: [{ type: 'text', text: longText }] },
+        { content: [{ output: [{ imageUrl: { url: pngDataUrl(1600, 1000) } }] }] },
+      ],
+    },
+  });
+  const r2 = await trimJsonBuffer(Buffer.from(withImg), trimCfg);
+  assert.ok(r2, '有图应该被处理');
+  const parsed = JSON.parse(r2.buffer.toString('utf8'));
+  assert.equal(parsed.data.items[0].content[0].text, longText, '正文必须逐字符相同');
+});
+
+test('trimJsonBuffer：文字里有省略号样式也不受影响', async () => {
+  const tricky = '…[已省略 805 字符 / 原长 846]…' + '尾巴'.repeat(100);
+  const body = JSON.stringify({
+    code: 0,
+    data: {
+      items: [
+        { content: [{ type: 'text', text: tricky }] },
+        { content: [{ output: [{ imageUrl: { url: pngDataUrl(1600, 1000) } }] }] },
+      ],
+    },
+  });
+  const res = await trimJsonBuffer(Buffer.from(body), trimCfg);
+  const parsed = JSON.parse(res.buffer.toString('utf8'));
+  assert.equal(parsed.data.items[0].content[0].text, tricky);
+});
+
+test('trimJsonBuffer：结构、字段名、数组长度全部不变', async () => {
+  const before = makeMessagesWithImages({ images: 3, w: 1600, h: 1000 });
+  const buf = Buffer.from(JSON.stringify(before));
+  const res = await trimJsonBuffer(buf, trimCfg);
+  assert.ok(res);
+
+  const after = JSON.parse(res.buffer.toString('utf8'));
+  assert.equal(after.data.items.length, before.data.items.length);
+  assert.deepEqual(Object.keys(after).sort(), Object.keys(before).sort());
+  assert.deepEqual(Object.keys(after.data).sort(), Object.keys(before.data).sort());
+  for (let i = 0; i < before.data.items.length; i += 1) {
+    assert.deepEqual(
+      Object.keys(after.data.items[i]).sort(),
+      Object.keys(before.data.items[i]).sort(),
+    );
   }
 });
 
-test('shouldTrim：没有 content-length 视为流式，不缓冲', () => {
-  const h = { 'content-type': 'application/json' };
-  assert.equal(shouldTrim(req('/api/v1/sessions/s1/transcript'), { headers: h }, trimCfg), false);
+// ---------------------------------------------------------------- 图片压缩
+
+test('shrinkPngDataUrl：大图被降采样，体积显著变小', () => {
+  const url = pngDataUrl(2000, 1250);
+  const res = shrinkPngDataUrl(url, trimCfg.image);
+  assert.ok(res, '2000x1250 应该被处理');
+  assert.ok(res.factor >= 2, `倍率应 >= 2，实际 ${res.factor}`);
+  assert.ok(res.outWidth < res.width, '宽度应变小');
+  assert.ok(res.outBytes < res.originalBytes, '体积应变小');
+  assert.match(res.url, /^data:image\/png;base64,/);
 });
 
-test('shouldTrim：超过缓冲上限的放行（保护进程内存）', () => {
-  const huge = trimCfg.maxBufferBytes + 1;
-  assert.equal(shouldTrim(req('/api/v1/sessions/s1/transcript'), { headers: jsonHeaders(huge) }, trimCfg), false);
+test('shrinkPngDataUrl：小图不动（不值得二次编码）', () => {
+  const url = pngDataUrl(300, 200);
+  const res = shrinkPngDataUrl(url, trimCfg.image);
+  assert.equal(res, null, '像素数低于上限应原样放过');
 });
 
-test('shouldTrim：HEAD 请求不处理', () => {
-  const len = 5 * 1024 * 1024;
-  assert.equal(shouldTrim(req('/api/v1/sessions/s1/transcript', 'HEAD'), { headers: jsonHeaders(len) }, trimCfg), false);
+test('shrinkPngDataUrl：非 PNG data URL 不处理', () => {
+  assert.equal(shrinkPngDataUrl('data:image/jpeg;base64,AAAA', trimCfg.image), null);
+  assert.equal(shrinkPngDataUrl('data:image/webp;base64,AAAA', trimCfg.image), null);
+  assert.equal(shrinkPngDataUrl('https://example.com/a.png', trimCfg.image), null);
+  assert.equal(shrinkPngDataUrl('not a url', trimCfg.image), null);
 });
 
-test('shouldTrim：开关关掉后一律不处理', () => {
-  const off = { ...trimCfg, enabled: false };
-  const len = 5 * 1024 * 1024;
-  assert.equal(shouldTrim(req('/api/v1/sessions/s1/transcript'), { headers: jsonHeaders(len) }, off), false);
+test('shrinkPngDataUrl：损坏的 base64 不抛异常，原样放过', () => {
+  const bad = `data:image/png;base64,${Buffer.from('not a real png at all').toString('base64')}`;
+  assert.equal(shrinkPngDataUrl(bad, trimCfg.image), null);
 });
 
-// ---- trimJsonBuffer：结构与内容 -------------------------------------------
-
-test('trimJsonBuffer：结构完全不变，只有超长字符串被截断', () => {
-  const raw = makeTranscript({ turns: 1, stepsPerTurn: 2, outputChars: 200000 });
-  const buf = Buffer.from(JSON.stringify(raw), 'utf8');
-  const r = trimJsonBuffer(buf, trimCfg);
-  assert.ok(r, '应返回结果');
-
-  const out = JSON.parse(r.buffer.toString('utf8'));
-
-  // 顶层结构
-  assert.deepEqual(Object.keys(out), Object.keys(raw));
-  assert.deepEqual(Object.keys(out.data), Object.keys(raw.data));
-  // items / steps / frames 数量一个不少
-  assert.equal(out.data.items.length, raw.data.items.length);
-  assert.equal(out.data.items[0].steps.length, raw.data.items[0].steps.length);
-  assert.equal(out.data.items[0].steps[0].frames.length, raw.data.items[0].steps[0].frames.length);
-  // 字段名逐个一致
-  assert.deepEqual(Object.keys(out.data.items[0]), Object.keys(raw.data.items[0]));
-  assert.deepEqual(Object.keys(out.data.items[0].steps[0]), Object.keys(raw.data.items[0].steps[0]));
-  // 类型保持不变（前端按原类型读取，改类型会直接白屏）
-  assert.equal(typeof out.data.items[0].steps[0].frames, 'object');
-  assert.equal(Array.isArray(out.data.items[0].steps[0].frames), true);
-  assert.equal(typeof out.data.items[0].steps[0].frames[1].output, 'string');
+test('shrinkPngDataUrl：超过 maxInputBytes 不处理', () => {
+  const cfg = { ...trimCfg.image, maxInputBytes: 1024 };
+  const url = pngDataUrl(2000, 1250);
+  assert.equal(shrinkPngDataUrl(url, cfg), null);
 });
 
-test('trimJsonBuffer：超长 output 被截断且带省略标记', () => {
-  const raw = makeTranscript({ turns: 1, stepsPerTurn: 1, outputChars: 200000 });
-  const buf = Buffer.from(JSON.stringify(raw), 'utf8');
-  const out = JSON.parse(trimJsonBuffer(buf, trimCfg).buffer.toString('utf8'));
-  const output = out.data.items[0].steps[0].frames[1].output;
-
-  assert.ok(output.length < 200000, '应被截短');
-  assert.match(output, /已省略/, '应带可读的省略标记');
-  assert.match(output, /完整内容请在电脑上查看/, '应提示去哪里看全文');
+test('shrinkPngDataUrl：压缩后的图仍是合法 PNG', () => {
+  const url = pngDataUrl(2000, 1250);
+  const res = shrinkPngDataUrl(url, trimCfg.image);
+  const bin = Buffer.from(res.url.split(',')[1], 'base64');
+  const decoded = decodePng(bin);
+  assert.ok(decoded, '应该能重新解码');
+  assert.equal(decoded.width, res.outWidth);
+  assert.equal(decoded.height, res.outHeight);
 });
 
-test('trimJsonBuffer：保留首尾 —— 头部与尾部内容都能看到', () => {
-  const head = 'HEAD_MARKER_';
-  const tail = '_TAIL_MARKER';
-  const middle = 'M'.repeat(200000);
-  const raw = { data: { items: [{ steps: [{ frames: [{ kind: 'tool', output: head + middle + tail }] }] }] } };
-  const out = JSON.parse(trimJsonBuffer(Buffer.from(JSON.stringify(raw), 'utf8'), trimCfg).buffer.toString('utf8'));
-  const output = out.data.items[0].steps[0].frames[0].output;
+// ---------------------------------------------------------------- 编解码往返
 
-  assert.ok(output.startsWith(head), '开头必须保留');
-  assert.ok(output.endsWith(tail), '结尾必须保留（结论通常在尾部）');
+test('decodePng / encodePng：往返后像素一致', () => {
+  const bin = makePng(64, 48);
+  const img = decodePng(bin);
+  assert.ok(img);
+  assert.equal(img.width, 64);
+  assert.equal(img.height, 48);
+
+  const re = encodePng(img, 6);
+  const img2 = decodePng(re);
+  assert.equal(img2.width, 64);
+  assert.equal(img2.height, 48);
+  assert.ok(img.pixels.equals(img2.pixels), '往返后像素应完全一致');
 });
 
-test('trimJsonBuffer：短字符串原样不动', () => {
-  const raw = makeTranscript({ turns: 1, stepsPerTurn: 1, outputChars: 10 });
-  const buf = Buffer.from(JSON.stringify(raw), 'utf8');
-  const out = JSON.parse(trimJsonBuffer(buf, trimCfg).buffer.toString('utf8'));
-  assert.deepEqual(out.data.items[0].steps[0].frames[1].output, raw.data.items[0].steps[0].frames[1].output);
+test('decodePng：非 PNG 返回 null', () => {
+  assert.equal(decodePng(Buffer.from('hello world')), null);
+  assert.equal(decodePng(Buffer.alloc(0)), null);
 });
 
-test('trimJsonBuffer：数字 / 布尔 / null 不被误伤', () => {
-  const raw = { code: 0, ok: true, data: null, n: 12345, arr: [1, 'short', false, null] };
-  const out = JSON.parse(trimJsonBuffer(Buffer.from(JSON.stringify(raw), 'utf8'), trimCfg).buffer.toString('utf8'));
-  assert.deepEqual(out, raw);
+test('downscale：倍率 1 原样返回', () => {
+  const img = decodePng(makePng(32, 32));
+  assert.equal(downscale(img, 1), img);
 });
 
-test('trimJsonBuffer：预算超了就逐级对折，最终落在总预算内', () => {
-  // 造一个远超 totalBytes 的响应
-  const raw = makeTranscript({ turns: 4, stepsPerTurn: 6, outputChars: 300000 });
-  const buf = Buffer.from(JSON.stringify(raw), 'utf8');
-  assert.ok(buf.length > trimCfg.totalBytes, '前提：原始响应应超过总预算');
-
-  const r = trimJsonBuffer(buf, trimCfg);
-  assert.ok(r.buffer.length <= trimCfg.totalBytes, `裁剪后应在预算内，实际 ${r.buffer.length}`);
-  // 注：不强制断言 attempts > 1 —— 首轮就可能靠 maxChars 直接达标，
-  // 对折只是兜底。这里只验证「最终一定落在预算内」这个契约。
-  assert.ok(r.stats.attempts >= 1);
-  // 即便对折，结构仍然完整
-  const out = JSON.parse(r.buffer.toString('utf8'));
-  assert.equal(out.data.items.length, raw.data.items.length);
+test('downscale：÷2 尺寸减半，÷4 尺寸四分之一', () => {
+  const img = decodePng(makePng(100, 80));
+  const d2 = downscale(img, 2);
+  assert.equal(d2.width, 50);
+  assert.equal(d2.height, 40);
+  const d4 = downscale(img, 4);
+  assert.equal(d4.width, 25);
+  assert.equal(d4.height, 20);
+  assert.equal(d4.pixels.length, 25 * 20 * img.channels);
 });
 
-test('trimJsonBuffer：非 JSON 返回 null，由调用方原样放过', () => {
-  assert.equal(trimJsonBuffer(Buffer.from('<html>not json</html>'), trimCfg), null);
-  assert.equal(trimJsonBuffer(Buffer.from(''), trimCfg), null);
+// ---------------------------------------------------------------- 统计与缓存
+
+test('stats：图片张数与字节数统计可信', async () => {
+  const before = makeMessagesWithImages({ images: 3, w: 1600, h: 1000 });
+  const buf = Buffer.from(JSON.stringify(before));
+  const res = await trimJsonBuffer(buf, trimCfg);
+  assert.ok(res);
+  assert.equal(res.stats.images, 3);
+  assert.ok(res.stats.originalImageBytes > res.stats.outImageBytes);
+  assert.equal(res.stats.details.length, 3);
+  assert.ok(res.stats.trimmedBytes < res.stats.originalBytes);
 });
 
-test('trimJsonBuffer：对折分支可达，且尽量逼近预算', () => {
-  // 场景：元素多、单字段中等（每个 8KB < maxChars 32KB，首轮砍不动）。
-  // 这条保证「对折重试」不是死代码。
-  const items = Array.from({ length: 400 }, (_, i) => ({ i, text: 'A'.repeat(8000) }));
-  const buf = Buffer.from(JSON.stringify({ data: { items } }), 'utf8');
-  assert.ok(buf.length > trimCfg.totalBytes, '前提：整体超预算');
-
-  const r = trimJsonBuffer(buf, trimCfg);
-  assert.ok(r.stats.attempts > 1, `应触发对折，实际 attempts=${r.stats.attempts}`);
-  assert.ok(r.buffer.length <= trimCfg.totalBytes, '最终应落在预算内');
-  assert.equal(JSON.parse(r.buffer.toString('utf8')).data.items.length, items.length, '元素数量不变');
+test('formatStats：摘要包含图片数与正文保留', async () => {
+  const before = makeMessagesWithImages({ images: 2, w: 1600, h: 1000 });
+  const res = await trimJsonBuffer(Buffer.from(JSON.stringify(before)), trimCfg);
+  const line = formatStats(res.stats);
+  assert.match(line, /图片 2 张/);
+  assert.match(line, /正文原样保留/);
 });
 
-test('trimJsonBuffer：结构本身超预算时有下限，不会无限压缩', () => {
-  // 极端：3 万个元素，光 JSON 骨架就接近 1MB。此时压缩有物理下限，
-  // 契约退化为「尽量小 + 结构完整」，不能保证落在预算内。
-  const items = Array.from({ length: 30000 }, (_, i) => ({ i, text: 'A'.repeat(900) }));
-  const buf = Buffer.from(JSON.stringify({ data: { items } }), 'utf8');
+test('缓存：同一响应第二次命中，结果一致', async () => {
+  const before = makeMessagesWithImages({ images: 2, w: 1600, h: 1000 });
+  const buf = Buffer.from(JSON.stringify(before));
 
-  const r = trimJsonBuffer(buf, trimCfg);
-  // 仍必须是合法 JSON、元素一个不少（宁可超预算，也不能让前端崩）
-  const out = JSON.parse(r.buffer.toString('utf8'));
-  assert.equal(out.data.items.length, items.length);
-  assert.ok(r.buffer.length < buf.length / 3, '仍应有显著压缩');
-  assert.equal(typeof r.stats.overBudget, 'boolean', '应显式标记是否未能达预算');
+  const r1 = await trimJsonBuffer(buf, trimCfg);
+  const r2 = await trimJsonBuffer(buf, trimCfg);
+  assert.ok(r1 && r2);
+  assert.ok(r2.buffer.equals(r1.buffer), '缓存命中应返回完全相同的结果');
+  assert.equal(r2.stats.cachedResponse, true);
+
+  const st = cacheStats();
+  assert.ok(st.responseEntries >= 1);
 });
 
-test('trimJsonBuffer：返回值统计可信（原始/裁剪后/省略字符）', () => {
-  const raw = makeTranscript({ turns: 2, stepsPerTurn: 3, outputChars: 100000 });
-  const buf = Buffer.from(JSON.stringify(raw), 'utf8');
-  const r = trimJsonBuffer(buf, trimCfg);
+test('并发：同一响应同时请求，只算一次且结果一致', async () => {
+  const before = makeMessagesWithImages({ images: 2, w: 1600, h: 1000 });
+  const buf = Buffer.from(JSON.stringify(before));
 
-  assert.equal(r.stats.originalBytes, buf.length);
-  assert.equal(r.stats.trimmedBytes, r.buffer.length);
-  assert.ok(r.stats.trimmedBytes < r.stats.originalBytes, '裁剪后必须更小');
-  assert.ok(r.stats.omittedChars > 0, '应记录省略的字符数');
-  assert.ok(r.stats.fields > 0, '应记录被截断的字段数');
+  const [a, b, c] = await Promise.all([
+    trimJsonBuffer(buf, trimCfg),
+    trimJsonBuffer(buf, trimCfg),
+    trimJsonBuffer(buf, trimCfg),
+  ]);
+  assert.ok(a && b && c);
+  assert.ok(a.buffer.equals(b.buffer));
+  assert.ok(a.buffer.equals(c.buffer));
 });
 
-test('trimJsonBuffer：真实体量的 transcript 降幅显著', () => {
-  // 模拟实测场景：单 turn 多 step，每个 step 带 ~1.7MB 工具输出
-  const raw = makeTranscript({ turns: 1, stepsPerTurn: 8, outputChars: 1_700_000 });
-  const buf = Buffer.from(JSON.stringify(raw), 'utf8');
-  const r = trimJsonBuffer(buf, trimCfg);
+test('clearCaches：清空后重新计算，结果仍一致', async () => {
+  const before = makeMessagesWithImages({ images: 1, w: 1600, h: 1000 });
+  const buf = Buffer.from(JSON.stringify(before));
 
-  const ratio = 1 - r.buffer.length / buf.length;
-  assert.ok(buf.length > 10 * 1024 * 1024, `原始应 >10MB，实际 ${(buf.length / 1048576).toFixed(1)}MB`);
-  assert.ok(ratio > 0.95, `降幅应 >95%，实际 ${(ratio * 100).toFixed(1)}%`);
+  const r1 = await trimJsonBuffer(buf, trimCfg);
+  await clearCaches();
+  const r2 = await trimJsonBuffer(buf, trimCfg);
+  assert.ok(r1 && r2);
+  assert.ok(r1.buffer.equals(r2.buffer));
 });
 
-test('trimJsonBuffer：深层嵌套不会爆栈（超过 MAX_DEPTH 原样返回）', () => {
-  let deep = { leaf: 'Y'.repeat(100000) };
-  for (let i = 0; i < 40; i += 1) deep = { child: deep };
-  const r = trimJsonBuffer(Buffer.from(JSON.stringify({ data: deep }), 'utf8'), trimCfg);
-  assert.ok(r, '不应抛异常');
-  assert.equal(typeof JSON.parse(r.buffer.toString('utf8')), 'object');
+// ---------------------------------------------------------------- 健壮性
+
+test('trimJsonBuffer：非 JSON 返回 null', async () => {
+  assert.equal(await trimJsonBuffer(Buffer.from('not json at all'), trimCfg), null);
+  assert.equal(await trimJsonBuffer(Buffer.from('<html></html>'), trimCfg), null);
 });
 
-test('trimJsonBuffer：超长数组元素逐个处理，数量不变', () => {
-  const raw = { data: { items: Array.from({ length: 50 }, (_, i) => ({ i, text: 'Z'.repeat(50000) })) } };
-  const out = JSON.parse(trimJsonBuffer(Buffer.from(JSON.stringify(raw), 'utf8'), trimCfg).buffer.toString('utf8'));
-  assert.equal(out.data.items.length, 50);
-  assert.ok(out.data.items.every((x) => x.text.length < 50000));
+test('trimJsonBuffer：深层嵌套不爆栈', async () => {
+  let node = { deep: pngDataUrl(1600, 1000) };
+  for (let i = 0; i < 200; i += 1) node = { child: node };
+  const body = JSON.stringify({ code: 0, data: node });
+  const res = await trimJsonBuffer(Buffer.from(body), trimCfg);
+  if (res) assert.ok(res.buffer.length > 0);
+});
+
+test('trimJsonBuffer：数组里混着图片与文字，只换图片', async () => {
+  const items = [
+    pngDataUrl(1600, 1000),
+    '纯文字',
+    123,
+    null,
+    { nested: pngDataUrl(1600, 1000) },
+    [pngDataUrl(1600, 1000)],
+  ];
+  const body = JSON.stringify({ code: 0, data: { items } });
+  const res = await trimJsonBuffer(Buffer.from(body), trimCfg);
+  assert.ok(res);
+  const after = JSON.parse(res.buffer.toString('utf8'));
+  assert.equal(after.data.items[1], '纯文字');
+  assert.equal(after.data.items[2], 123);
+  assert.equal(after.data.items[3], null);
+  assert.equal(after.data.items.length, 6);
+  assert.equal(res.stats.images, 3, '应该换了 3 张图');
 });

@@ -117,23 +117,17 @@ export function loadConfig(env = process.env) {
     compress,
     accessLog,
 
-    // ---- 大响应裁剪 ----------------------------------------------------------
-    // Desktop 的 /transcript 会把每个 step 的 frames[].output（工具完整输出）
-    // 全量返回。实测一个会话 30.87 MB，其中 frames 占 30.81 MB（99.8%）。
-    // 手机在 5G 下拉 30MB，前端 fetch 的 30s 超时先到 → 「HTTP 200 但
-    // parse 阶段 Failed to fetch」。这里在传输层做投影，不动桌面端数据。
+    // ---- 大响应瘦身（只压缩图片）---------------------------------------------
+    // Desktop 的 /messages、/transcript 会把工具执行的截图以 base64 PNG 全量
+    // 返回。实测一个长会话 5.41 MB，其中 5.36 MB 是 4 张 2000x1250 截图
+    // （占 99.1%），而全部对话文字不到 50 KB。
+    //
+    // 手机在 5G 下拉 5 MB 会超过前端 fetch 超时 → 「HTTP 200 但 Failed to fetch」。
+    //
+    // 处理原则：**只降图片分辨率，文字一个字符都不动。**
+    // 图片降采样后照样看得清内容；文字少一个字都可能改变语义。
     trim: {
       enabled: toBool('POCKET_TRIM', env.POCKET_TRIM, true),
-      // 单个字符串最多保留多少字符（首 60% + 尾 28%，中间省略）
-      maxChars: toInt('POCKET_TRIM_MAX_CHARS', env.POCKET_TRIM_MAX_CHARS, 32 * 1024, {
-        min: 512,
-        max: 4 * 1024 * 1024,
-      }),
-      // 裁剪后整体目标上限：超过就对折 maxChars 重试
-      totalBytes: toInt('POCKET_TRIM_TOTAL_KB', env.POCKET_TRIM_TOTAL_KB, 1024, {
-        min: 64,
-        max: 64 * 1024,
-      }) * 1024,
       // 小于这个大小的响应不处理（省 CPU）
       minBytes: toInt('POCKET_TRIM_MIN_KB', env.POCKET_TRIM_MIN_KB, 256, {
         min: 1,
@@ -149,6 +143,30 @@ export function loadConfig(env = process.env) {
         .split(',')
         .map((s) => s.trim())
         .filter(Boolean),
+
+      // ---- 图片压缩策略 ----
+      image: {
+        // 单张图允许的最大像素数。超过就按比例降采样。
+        // 默认 400000 ≈ 666x416：2000x1250 的截图会降到 ÷3，
+        // 实测 4 张图 4.02MB → 361KB（−91.2%），手机上看依然清晰；
+        // 且 ÷3 比 ÷2 的降采样耗时更短（少一半像素）。
+        maxPixels: toInt('POCKET_IMG_MAX_PIXELS', env.POCKET_IMG_MAX_PIXELS, 400_000, {
+          min: 10_000,
+          max: 40_000_000,
+        }),
+        // 小于这个字节数的图不值得折腾
+        minBytes: toInt('POCKET_IMG_MIN_KB', env.POCKET_IMG_MIN_KB, 16, {
+          min: 1,
+          max: 4096,
+        }) * 1024,
+        // 小于这个字符数的字符串连前缀检查都跳过（纯性能优化）
+        minChars: 24 * 1024,
+        // 超过这个大小的图不处理（解码后内存可能翻数倍，保护进程）
+        maxInputBytes: toInt('POCKET_IMG_MAX_INPUT_MB', env.POCKET_IMG_MAX_INPUT_MB, 12, {
+          min: 1,
+          max: 64,
+        }) * 1024 * 1024,
+      },
     },
 
     rateLimitPerMin: toInt('POCKET_RATE_LIMIT', env.POCKET_RATE_LIMIT, 600, { min: 0, max: 100000 }),

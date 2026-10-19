@@ -52,9 +52,9 @@ git grep -niE '<你的域名关键词>'
 - [ ] `CHANGELOG.md`
 - [ ] `package.json`（`version` 与 CHANGELOG 最新条目一致）
 - [ ] `.gitignore`
-- [ ] `src/proxy.mjs` + `src/lib/{config,args,discovery,rewrite,auth,pages,qr,pairwatch}.mjs`
+- [ ] `src/proxy.mjs` + `src/lib/{config,args,discovery,rewrite,auth,pages,qr,pairwatch,trim,image,image-async,image-worker}.mjs`
 - [ ] `scripts/`（`.ps1` × 3、`.sh` × 3、`.vbs`、`launch.mjs`）
-- [ ] `test/`（9 个测试文件）
+- [ ] `test/`（10 个测试文件）
 - [ ] `docs/how-it-works.md`、`docs/MAINTAINER-CHECKLIST.md`
 - [ ] `.github/workflows/ci.yml`
 
@@ -86,7 +86,7 @@ git ls-files -s scripts/*.sh     # 期望 mode 是 100755
 
 ```bash
 npm run check        # 全部模块语法检查
-npm test             # 126 个用例，必须全绿
+npm test             # 133 个用例，必须全绿
 ```
 
 - [ ] `npm test` 全绿

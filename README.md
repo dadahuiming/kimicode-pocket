@@ -11,7 +11,7 @@
 [![Cloudflare Tunnel](https://img.shields.io/badge/Cloudflare-Tunnel-F38020?logo=cloudflare&logoColor=white)](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-0078D6)](#平台适配)
-[![Tests](https://img.shields.io/badge/tests-126%20passing-brightgreen)](#开发与测试)
+[![Tests](https://img.shields.io/badge/tests-133%20passing-brightgreen)](#开发与测试)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)](package.json)
 
 </div>
@@ -102,13 +102,13 @@ Cloudflare 隧道 ──────► proxy.mjs (固定端口 50980) ───
 | **真正区分本机与公网** | 「本机」= 回环 socket **且** 无 Cloudflare 头，隧道来客拿不到任何内部端点 |
 | **可选第二道口令** | `POCKET_PIN`，Cookie 会话 + 失败限速（5 次 / 60 秒） |
 | **响应压缩** | JSON 走 brotli/gzip（大响应自动提高压缩比）；SSE 明确跳过 |
-| **大响应裁剪** | `/transcript`、`/messages` 超阈值时截断超长字符串（**JSON 结构不变**）；实测 57 MB → 241 KB |
+| **截图降采样** | `/transcript`、`/messages` 里的 base64 PNG 截图按比例降采样；**文字一个字符都不动**。实测 51 MB → 8.1 MB（其中文字 1.95 MB 原样保留） |
 | **崩溃自愈** | 看门狗 30 秒探活，连续 2 次失败才重启（防抖，不打断对话） |
 | **安全默认值** | 只绑 `127.0.0.1`；绑非回环又没设 PIN 时**直接拒绝启动** |
 | **零依赖** | 只用 Node 内置模块，`npm install` 都不需要 |
 | **不脏仓库** | 日志与配对产物一律落在平台状态目录，跑完 `git status` 依然干净 |
 | **跨平台** | 核心代理三平台通用；常驻脚本按平台提供 |
-| **可测** | 126 个用例（含进程级集成测试），CI 覆盖三平台 × 两个 Node 版本 |
+| **可测** | 133 个用例（含进程级集成测试），CI 覆盖三平台 × 两个 Node 版本 |
 
 ---
 
@@ -477,9 +477,10 @@ POCKET_PUBLIC_URL=https://kimicode.example.com node src/proxy.mjs --pair-only
 | `POCKET_UPSTREAM_TIMEOUT_MS` | `120000` | 上游**空闲**超时（不是总时长） |
 | `POCKET_MAX_BODY_MB` | `64` | 请求体上限 |
 | `POCKET_COMPRESS` | `1` | JSON 响应压缩开关 |
-| `POCKET_TRIM` | `1` | 大响应裁剪开关（见下方「大响应裁剪」） |
-| `POCKET_TRIM_MAX_CHARS` | `32768` | 单个字符串最多保留字符数（首 60% + 尾 28%） |
-| `POCKET_TRIM_TOTAL_KB` | `1024` | 裁剪后整体目标上限；超了按比例再压 |
+| `POCKET_TRIM` | `1` | 截图降采样开关（见下方「大响应瘦身」） |
+| `POCKET_IMG_MAX_PIXELS` | `400000` | 单张截图最大像素数，超过才降采样 |
+| `POCKET_IMG_MIN_KB` | `16` | 小于此大小的图不处理 |
+| `POCKET_IMG_MAX_INPUT_MB` | `12` | 超过此大小的图不处理（保护内存） |
 | `POCKET_TRIM_MIN_KB` | `256` | 小于此值的响应不处理 |
 | `POCKET_TRIM_MAX_BUFFER_MB` | `128` | 超过此值不缓冲（保护进程内存） |
 | `POCKET_TRIM_PATHS` | `transcript,messages` | 生效路径（子串匹配，小写） |
@@ -568,7 +569,7 @@ curl http://127.0.0.1:50980/__status
 
 ---
 
-## 大响应裁剪
+## 大响应瘦身（只压截图，不动文字）
 
 ### 这个功能解决什么问题
 
@@ -590,76 +591,91 @@ Web 没有拿到 Kimi 服务器的响应。
 **200 却失败**，说明响应头已经正常返回了——问题出在**响应体没读完**就被浏览器的
 `fetch` 超时（通常 30 秒）掐断。真正的原因是**数据太大**。
 
-Desktop 的 `/api/v1/sessions/<id>/transcript` 会把整条 turn 的每个 step 的
-`frames[]` 全量返回，而 `frames[].output` 是**工具执行的完整输出**（读文件、
-跑命令的全文）。实测一个会话：
+### 体积到底花在哪里
 
-```
-transcript 总计   30.87 MB
-其中 frames      30.81 MB  (99.8%)
-```
+逐字段统计后才看清：**几乎全在工具截图上**。
 
-该 turn 有 100+ 个 step，每个 step 带约 1.7 MB 输出。手机在 4G/5G 下拉这
-30 MB，必然超时。
+| 响应 | 总大小 | 截图 base64 | 文字 |
+|---|---|---|---|
+| `/messages` | 5.41 MB | **5.36 MB（99.1%）** | < 50 KB |
+| `/transcript` | 51.00 MB | **48.63 MB（95.4%）** | 1.95 MB |
+
+Desktop 会把工具执行时截的图以 `data:image/png;base64,...` 内嵌在响应里，
+单张 2000×1250 的截图就有 **1.5 MB**。一个会话几十张，体积就上去了。
 
 > ⚠️ **`page_size` 对它无效**：实测 `page_size=1 / 3 / 10` 返回的都是同一份
-> 全量数据（都是 30.89 MB）。不能靠调分页规避。
+> 全量数据。不能靠调分页规避。
 
-### 怎么解决
+### 怎么解决：只降图片分辨率
 
-在**传输层**把超长字符串剪短，**JSON 结构一点不动**：
+> **文字一个字符都不动。** 这是设计红线。
+>
+> 早期版本曾按「总预算对折所有字符串」来压，结果把 846 字符的正文砍成了
+> 41 字符 + 一行省略号 —— 用信息的完整性去换体积，是错的。
+> 现在的做法只动图片：图片是有损也无所谓的呈现层，降分辨率后照样看得清；
+> 文字少一个字都可能改变语义。
 
 ```
-原来：{"output":"……（1.7 MB 的完整文件内容）……"}
-现在：{"output":"……（首次 60%）…… [已省略 1,234,567 字符 / 原长 2,000,000；
-       完整内容请在电脑上查看] ……（尾部 28%）……"}
+原来：{"imageUrl":{"url":"data:image/png;base64,iVBORw0KGgo…（2000×1250，1.5 MB）"}}
+现在：{"imageUrl":{"url":"data:image/png;base64,iVBORw0KGgo…（666×416，112 KB）"}}
 ```
 
-**为什么必须"只截断字符串、不改结构"**：前端是这么读的——
-
-```js
-session.steps.map(step => step.frames.forEach(f => f.output))
-```
-
-一旦把 `steps` 删掉、把 `frames` 改成字符串、或把数组换成对象，**前端立刻白屏**。
-所以裁剪只动"字符串的长度"，类型、字段名、元素数量、层级关系全部保持原样。
-
-保留**首 60% + 尾 28%** 是有依据的：工具输出通常"开头说明要做什么、结尾给结论"，
-中间才是那一大坨重复日志。
+压缩在传输层完成：纯 JS 解码 PNG → 箱式降采样 → 重新编码，**零依赖**。
+JSON 结构、字段名、数组长度、以及所有文字内容**完全不变**。
 
 ### 效果（实测）
 
-| 接口 | 裁剪前 | 裁剪后 | 降幅 |
-|---|---|---|---|
-| `/transcript` | 57.4 MB | **241 KB** | **−99.58%** |
-| `/messages` | 7.86 MB | **146 KB** | **−98.14%** |
+| 项 | 数值 |
+|---|---|
+| `/transcript` | 51.00 MB → **8.07 MB**（图片 35.85 MB → 3.46 MB，−90.6%） |
+| `/messages` | 5.41 MB → **0.51 MB**（图片 4.02 MB → 361 KB，−91.2%） |
+| 首次处理耗时 | 1.2 s（31 张图，worker 线程并行） |
+| 二次请求耗时 | **27 ms**（整响应缓存命中） |
 
-耗时约 **135 ms**。响应头带 `x-pocket-trimmed: 1`，便于确认是否命中。
+响应头带 `x-pocket-trimmed: 1`，便于确认是否命中。
 
-结构性验证（裁剪前后逐项比对）：
+单张 2000×1250 截图的档位对比：
 
-- `items` 数量 `24 → 24`
-- `steps` 数量 `154 → 154`
-- `frames` 数量 `3 → 3`
-- 字段名与顺序完全一致
-- 短于阈值的字符串**原样不动**
+| 档位 | 尺寸 | 单张体积 | 31 张合计 | 耗时 |
+|---|---|---|---|---|
+| 原图 | 2000×1250 | 1563 KB | 35.85 MB | — |
+| **÷3（默认）** | 666×416 | ~112 KB | **3.46 MB** | 1.2 s |
+| ÷2 | 1000×625 | ~215 KB | 7.4 MB | 2.3 s |
+
+### 性能设计
+
+长会话要处理 30+ 张图，如果都在主线程同步做，Node 会被卡住 —— 期间所有
+HTTP 请求、WebSocket 心跳全部排队，页面表现为「卡死 / 一直加载中」。
+所以：
+
+- **worker 线程池**（默认 4 个）：CPU 活在别的线程跑，主线程只负责 IO。
+- **图片级缓存**：按内容哈希，同一张图只算一次。
+- **整响应缓存**：内容没变时直接复用，51 MB 的二次请求 27 ms。
+- **并发闸门**：同一时刻最多处理 2 个瘦身任务，其余排队（上游流不读，
+  靠 TCP 背压把压力推回 Desktop，内存不会爆）。
+- **重复请求合并**：前端会并发打 13 个一模一样的 `/transcript`，只算一次。
 
 ### 生效范围
 
 | 会处理 | 不会处理 |
 |---|---|
 | 路径含 `transcript` 或 `messages` | 会话列表、status、models 等 |
-| `application/json` | `text/event-stream`（SSE，压缩/裁剪都会破坏流） |
-| 大于 `POCKET_TRIM_MIN_KB`（默认 256 KB） | 小于阈值的小响应（不值得费 CPU） |
+| `data:image/png;base64,...` | JPEG / WebP（已是压缩格式） |
+| 像素数 > `POCKET_IMG_MAX_PIXELS` | 小图（不值得二次编码） |
+| `application/json` | `text/event-stream`（SSE，处理会破坏流） |
+| 大于 `POCKET_TRIM_MIN_KB`（默认 256 KB） | 小于阈值的小响应 |
 | 上游未压缩的响应 | 上游已带 `content-encoding` 的 |
 
 ### 调整力度
 
 ```bash
-# 更激进：单字段压到 8 KB，整体目标 256 KB
-POCKET_TRIM_MAX_CHARS=8192 POCKET_TRIM_TOTAL_KB=256 node src/proxy.mjs
+# 更小：单张图压到 144000 像素（500×312），体积再降一半
+POCKET_IMG_MAX_PIXELS=144000 node src/proxy.mjs
 
-# 完全关闭（只想原样透传）
+# 更清晰：允许 1000×640
+POCKET_IMG_MAX_PIXELS=640000 node src/proxy.mjs
+
+# 完全关闭（只想原样透传，接受长会话打不开）
 POCKET_TRIM=0 node src/proxy.mjs
 
 # 只对 transcript 生效，不动 messages
@@ -668,11 +684,13 @@ POCKET_TRIM_PATHS=transcript node src/proxy.mjs
 
 ### 已知边界
 
-- **JSON 骨架本身超预算时压不下去**。例如 3 万个元素、每字段都很短，
-  光 JSON 结构就接近 1 MB。此时会尽量压并在日志里标记
-  `[警告] 仍超预算（结构过大，非字符串可解）`——**宁可超预算，也不让前端崩**。
-- 裁剪**只在代理这一层**做，Desktop 的原始数据完好无损，电脑上仍可看到全文。
-- 裁剪后的文字里会出现「已省略 N 字符」标记，这是预期行为。
+- **降采样是有损的**：截图变小后细节会损失。文字仍可辨认，但不适合放大细看；
+  需要原图时在电脑上查看。
+- **只处理 PNG**。若 Kimi 后续改成 JPEG / WebP 截图，本条会自动跳过
+  （不会破坏内容，只是不再瘦身）。
+- 瘦身**只在代理这一层**做，Desktop 的原始数据完好无损。
+- 若某张图的 JSON 骨架本身就超过缓冲上限（默认 128 MB），该响应会原样放过
+  并可能仍然打不开 —— 此时可调 `POCKET_TRIM_MAX_BUFFER_MB`。
 
 ---
 
@@ -707,13 +725,13 @@ Desktop 用 `KIMI_CODE_HOME ?? os.homedir()/.kimi-code` 推导，**三平台同�
 | 常驻 | `scripts/watchdog.ps1` + `.vbs` | `scripts/watchdog.sh` 或 systemd / launchd | ✅ Windows 有长期运行痕迹 |
 | 停止 | `scripts/stop.ps1` | `scripts/stop.sh` | ✅ Windows 实测 |
 | 隧道服务管理 | `scripts/tunnel-service.ps1` | `scripts/tunnel-service.sh` | Windows `status`/`check` 实测；`harden`/`watch` 需管理员；*nix 未实测 |
-| 测试 | `npm test` | `npm test` | ✅ Windows 实测 126/126；CI 覆盖三平台 |
+| 测试 | `npm test` | `npm test` | ✅ Windows 实测 133/133；CI 覆盖三平台 |
 
 > ### ⚠️ 关于脚本验证状态（请先读）
 >
 > **`src/proxy.mjs` 是核心，三平台通用**，其中的转发逻辑（端口发现、Host/Origin 改写、
 > WebSocket 透传）来自**已在生产长期运行的实现**；本次新增的能力
-> （配对、PIN、压缩、限速、本机判定、配对状态回显）已有 126 个自动化测试覆盖，其中包含真实拉起进程的集成测试（假 Desktop 全链路 + CLI 入口）。
+> （配对、PIN、压缩、限速、本机判定、配对状态回显）已有 133 个自动化测试覆盖，其中包含真实拉起进程的集成测试（假 Desktop 全链路 + CLI 入口）。
 >
 > 但要说清楚：**`scripts/*.sh` 三个 shell 脚本只在 Git Bash 做过 `bash -n` 语法校验，
 > 未在真实 macOS / Linux 上端到端跑通。** `start-tunnel.ps1` 是重写过的版本，
@@ -1716,6 +1734,10 @@ kimicode-pocket/
 │       ├── auth.mjs           # 会话令牌、Cookie、失败限速、全局限速
 │       ├── pages.mjs          # 登录页 / 配对页 / 错误页（内联，无外链）
 │       ├── pairwatch.mjs      # 终端倒计时 + 配对状态回显（成功即收尾）
+│       ├── trim.mjs           # 大响应瘦身：只压截图，文字不动；并发闸门 + 缓存
+│       ├── image.mjs          # 零依赖 PNG 解码 / 箱式降采样 / 重编码
+│       ├── image-async.mjs    # worker 池调度 + 内容哈希去重
+│       ├── image-worker.mjs   # worker 线程入口（PNG 压缩的 CPU 活）
 │       └── qr.mjs             # 零依赖二维码：SVG / 终端 / PNG
 ├── scripts/
 │   ├── start-tunnel.ps1       # Windows：起隧道 + 配对码 + 二维码
@@ -1787,7 +1809,7 @@ kimicode-pocket/
 # 零依赖，不需要 npm install
 node src/proxy.mjs            # 启动
 npm run check                 # 语法检查（全部模块）
-npm test                      # 126 个用例
+npm test                      # 133 个用例
 ```
 
 测试分两层：

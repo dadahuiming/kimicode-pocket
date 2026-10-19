@@ -11,7 +11,7 @@
 [![Cloudflare Tunnel](https://img.shields.io/badge/Cloudflare-Tunnel-F38020?logo=cloudflare&logoColor=white)](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-0078D6)](#platform-parity)
-[![Tests](https://img.shields.io/badge/tests-126%20passing-brightgreen)](#development--testing)
+[![Tests](https://img.shields.io/badge/tests-133%20passing-brightgreen)](#development--testing)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)](package.json)
 
 </div>
@@ -98,12 +98,13 @@ loopback on both HTTP and WebSocket, and relays everything.
 | **Real local-vs-public split** | "Local" means loopback socket **and** no Cloudflare headers; tunnel traffic gets no internal endpoints |
 | **Optional second password** | `POCKET_PIN`, cookie session, 5 failures / 60s |
 | **Response compression** | JSON only, brotli/gzip (bigger responses get a higher level); SSE explicitly skipped |
+| **Screenshot downscaling** | base64 PNG screenshots in `/transcript` and `/messages` are downscaled; **not one character of text is touched**. 51 MB → 8.1 MB measured, with 1.95 MB of text preserved verbatim |
 | **Crash recovery** | Watchdog probes every 30s, restarts only after 2 consecutive failures (no interrupted conversations) |
 | **Safe defaults** | Binds `127.0.0.1` only; refuses to start on a non-loopback bind without a PIN |
 | **Zero dependencies** | Node built-ins only — you don't even need `npm install` |
 | **Doesn't dirty the repo** | Logs and pairing artefacts go to the platform state directory; `git status` stays clean |
 | **Cross-platform** | Proxy core is identical on all three platforms; only the daemon scripts differ |
-| **Testable** | 126 tests, including process-level integration tests; CI covers 3 OS × 2 Node versions |
+| **Testable** | 133 tests, including process-level integration tests; CI covers 3 OS × 2 Node versions |
 
 ---
 
@@ -473,6 +474,13 @@ Command-line flags win over the same-named environment variable.
 | `POCKET_UPSTREAM_TIMEOUT_MS` | `120000` | Upstream **idle** timeout (not total) |
 | `POCKET_MAX_BODY_MB` | `64` | Request body limit |
 | `POCKET_COMPRESS` | `1` | JSON response compression |
+| `POCKET_TRIM` | `1` | Screenshot downscaling (see "Large responses" below) |
+| `POCKET_IMG_MAX_PIXELS` | `400000` | Max pixels per screenshot; larger ones get downscaled |
+| `POCKET_IMG_MIN_KB` | `16` | Images smaller than this are left alone |
+| `POCKET_IMG_MAX_INPUT_MB` | `12` | Images larger than this are skipped (memory guard) |
+| `POCKET_TRIM_MIN_KB` | `256` | Responses smaller than this are not processed |
+| `POCKET_TRIM_MAX_BUFFER_MB` | `128` | Responses larger than this are not buffered |
+| `POCKET_TRIM_PATHS` | `transcript,messages` | Paths to process (case-insensitive substring) |
 | `POCKET_ACCESS_LOG` | `1` | Access log |
 | `POCKET_RATE_LIMIT` | `600` | Requests per minute per IP, `0` disables |
 | `POCKET_PAIR_TTL_SEC` | `180` | One-time code lifetime in seconds (min 30) |
@@ -562,6 +570,108 @@ read it as "how many were ever issued":
 
 ---
 
+## Large responses (screenshots only — text is never touched)
+
+### The symptom
+
+Opening a long session on a phone shows:
+
+```
+Cannot reach the Kimi server
+The web UI did not get a response from the Kimi server.
+```
+
+Expanding "View details" reveals something counter-intuitive:
+
+| Field | Value |
+|---|---|
+| HTTP status | **200** |
+| Failure stage | `parse` |
+| Underlying error | `TypeError: Failed to fetch` |
+
+**200 yet failed** means the headers arrived fine — the body was cut off by the
+browser's `fetch` timeout. The real cause is **response size**.
+
+### Where the bytes actually go
+
+Field-by-field measurement made it obvious: **almost all of it is tool screenshots.**
+
+| Response | Total | Screenshot base64 | Text |
+|---|---|---|---|
+| `/messages` | 5.41 MB | **5.36 MB (99.1%)** | < 50 KB |
+| `/transcript` | 51.00 MB | **48.63 MB (95.4%)** | 1.95 MB |
+
+Kimi Desktop embeds tool screenshots as `data:image/png;base64,...`; a single
+2000×1250 screenshot is **1.5 MB**. Tens of them per session add up fast.
+
+> ⚠️ **`page_size` does not help**: `page_size=1 / 3 / 10` all returned the same
+> full payload in testing.
+
+### The fix: downscale images only
+
+> **Not a single character of text is touched.** That is a hard design rule.
+>
+> An earlier version compressed by "folding every string against a total budget",
+> which cut an 846-character reply down to 41 characters plus an ellipsis — trading
+> content integrity for bytes. That was wrong. Now only images are touched: they are
+> a lossy-by-nature presentation layer, and downscaled screenshots remain readable,
+> whereas losing one word of text can change the meaning.
+
+```
+before: {"imageUrl":{"url":"data:image/png;base64,iVBORw0KGgo…(2000×1250, 1.5 MB)"}}
+after:  {"imageUrl":{"url":"data:image/png;base64,iVBORw0KGgo…(666×416, 112 KB)"}}
+```
+
+Done at the transport layer: pure-JS PNG decode → box downscale → re-encode, **zero
+dependencies**. JSON structure, field names, array lengths and all text stay identical.
+
+### Measured results
+
+| Item | Value |
+|---|---|
+| `/transcript` | 51.00 MB → **8.07 MB** (images 35.85 MB → 3.46 MB, −90.6%) |
+| `/messages` | 5.41 MB → **0.51 MB** (images 4.02 MB → 361 KB, −91.2%) |
+| First request | 1.2 s (31 images, parallel in worker threads) |
+| Second request | **27 ms** (whole-response cache hit) |
+
+Responses carry `x-pocket-trimmed: 1` so you can confirm a hit.
+
+### Performance design
+
+A long session has 30+ images. Doing that synchronously on the main thread stalls
+Node — every HTTP request and WebSocket heartbeat queues behind it, and the page
+looks frozen or stuck loading. So:
+
+- **Worker pool** (4 by default): CPU work runs off the main thread.
+- **Per-image cache**: keyed by content hash; each image is processed once.
+- **Whole-response cache**: 51 MB re-request drops from 3131 ms to 27 ms.
+- **Concurrency gate**: at most 2 shrink jobs at a time; the rest queue (the upstream
+  stream is left unread, so TCP backpressure pushes the load back to Desktop).
+- **Request coalescing**: the frontend fires 13 identical `/transcript` requests;
+  only one is computed.
+
+### Scope
+
+| Processed | Not processed |
+|---|---|
+| Paths containing `transcript` or `messages` | Session list, status, models, etc. |
+| `data:image/png;base64,...` | JPEG / WebP (already compressed) |
+| Images above `POCKET_IMG_MAX_PIXELS` | Small images (not worth re-encoding) |
+| `application/json` | `text/event-stream` (SSE) |
+| Above `POCKET_TRIM_MIN_KB` (default 256 KB) | Small responses |
+
+### Known limits
+
+- **Downscaling is lossy**: fine detail is lost. Text stays legible but the result is
+  not meant for zooming in; view the original on the desktop.
+- **PNG only.** If Kimi switches to JPEG/WebP screenshots this silently stops applying
+  (content is untouched, it just stops shrinking).
+- Shrinking happens **only in the proxy**; Desktop data is unchanged.
+- If a response exceeds the buffer cap (default 128 MB) it is passed through as-is and
+  may still fail to open — raise `POCKET_TRIM_MAX_BUFFER_MB` in that case.
+
+---
+
 ## Platform parity
 
 `src/proxy.mjs` + `src/lib/*` are **identical on all three platforms** (pure Node
@@ -589,7 +699,7 @@ built-ins). What differs is daemonisation and paths.
 | Run 24/7 | `scripts/watchdog.ps1` + `.vbs` | `scripts/watchdog.sh` or systemd / launchd | ✅ long-running on Windows |
 | Stop | `scripts/stop.ps1` | `scripts/stop.sh` | ✅ tested on Windows |
 | Tunnel service | `scripts/tunnel-service.ps1` | `scripts/tunnel-service.sh` | Windows `status`/`check` tested; `harden`/`watch` need admin; *nix untested |
-| Tests | `npm test` | `npm test` | ✅ 126/126 on Windows; CI covers all three |
+| Tests | `npm test` | `npm test` | ✅ 133/133 on Windows; CI covers all three |
 
 > ### ⚠️ About verification status (please read)
 >
@@ -1421,6 +1531,10 @@ kimicode-pocket/
 │       ├── auth.mjs           # session tokens, cookies, failure limiter, rate limiter
 │       ├── pages.mjs          # login / pairing / error pages (inline, no external links)
 │       ├── pairwatch.mjs      # terminal countdown + pairing status echo (stops on success)
+│       ├── trim.mjs           # large-response shrink: images only, text untouched; gate + caches
+│       ├── image.mjs          # zero-dependency PNG decode / box downscale / re-encode
+│       ├── image-async.mjs    # worker pool scheduling + content-hash dedup
+│       ├── image-worker.mjs   # worker-thread entry (the CPU-bound PNG work)
 │       └── qr.mjs             # zero-dependency QR: SVG / terminal / PNG
 ├── scripts/
 │   ├── start-tunnel.ps1       # Windows: tunnel + pairing code + QR
@@ -1498,7 +1612,7 @@ See [docs/how-it-works.md](docs/how-it-works.md) for the long version.
 # zero dependencies, no npm install required
 node src/proxy.mjs            # run
 npm run check                 # syntax check (all modules)
-npm test                      # 126 tests
+npm test                      # 133 tests
 ```
 
 Two layers of tests:

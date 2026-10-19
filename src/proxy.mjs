@@ -37,7 +37,7 @@ import { loadConfig, ConfigError } from './lib/config.mjs';
 import { parseArgs, parsePairCount, MAX_PAIR_COUNT } from './lib/args.mjs';
 import { createDiscovery } from './lib/discovery.mjs';
 import { rewriteHeaders, rewriteRawHeaders, isLocalRequest, clientIp } from './lib/rewrite.mjs';
-import { shouldTrim, trimJsonBuffer } from './lib/trim.mjs';
+import { shouldTrim, trimJsonBuffer, formatStats } from './lib/trim.mjs';
 import {
   newSessionToken,
   verifySessionToken,
@@ -56,7 +56,7 @@ const CREDENTIAL_TTL_DAYS = 7;
 const MAX_LOG_BYTES = 5 * 1024 * 1024;
 const LOG_FLUSH_MS = 500;
 const LOG_FLUSH_LINES = 64;
-const VERSION = '1.4.0';
+const VERSION = '1.5.0';
 
 const HELP = `KimiCode Pocket ${VERSION}
 
@@ -867,9 +867,10 @@ const server = http.createServer(async (req, res) => {
     (proxyRes) => {
       const hdrs = { ...proxyRes.headers };
 
-      // ---- 大响应裁剪（优先于压缩）------------------------------------------
-      // transcript / messages 里 frames[].output 是工具完整输出，实测占响应
-      // 99.8%。先裁剪再压缩：既减少体积也减少 CPU。
+      // ---- 大响应瘦身（优先于压缩）------------------------------------------
+      // transcript / messages 里工具截图是 base64 PNG。实测 /transcript 51MB
+      // 里 48.6MB 是 38 张截图（95.4%），文字只有 1.95MB。
+      // 这里只降图片分辨率，文字一个字符都不动；压缩跑在 worker 线程。
       if (shouldTrim(req, proxyRes, cfg.trim)) {
         void (async () => {
           try {
@@ -880,8 +881,8 @@ const server = http.createServer(async (req, res) => {
               if (size > cfg.trim.maxBufferBytes) throw new Error('trim buffer overflow');
               chunks.push(chunk);
             }
-            const result = trimJsonBuffer(Buffer.concat(chunks), cfg.trim);
-            if (!result) throw new Error('not json');
+            const result = await trimJsonBuffer(Buffer.concat(chunks), cfg.trim);
+            if (!result) throw new Error('nothing to shrink');
 
             const body = result.buffer;
             const out = { ...hdrs };
@@ -891,11 +892,9 @@ const server = http.createServer(async (req, res) => {
             out['x-pocket-trimmed'] = '1';
 
             log(
-              `trim ${pathname}: ${(result.stats.originalBytes / 1024 / 1024).toFixed(2)}MB -> ` +
-                `${(result.stats.trimmedBytes / 1024).toFixed(0)}KB ` +
-                `(省略 ${result.stats.omittedChars} 字符 / ${result.stats.fields} 字段 / ` +
-                `${result.stats.attempts} 轮, maxChars=${result.stats.maxChars})` +
-                (result.stats.overBudget ? ' [警告] 仍超预算（结构过大，非字符串可解）' : ''),
+              `瘦身 ${pathname}: ${(result.stats.originalBytes / 1024 / 1024).toFixed(2)}MB → ` +
+                `${(result.stats.trimmedBytes / 1024 / 1024).toFixed(2)}MB；` +
+                formatStats(result.stats),
             );
 
             // 裁剪后一般只有几百 KB，压缩收益有限；但手机流量仍是钱，
@@ -912,7 +911,10 @@ const server = http.createServer(async (req, res) => {
                   : createGzip({ level: 6 });
               z.on('error', () => res.destroy());
               res.on('close', () => z.destroy());
-              z.end(body, () => z.pipe(res));
+              // 先接管道再写入：写成 z.end(body, () => z.pipe(res)) 会让
+              // 压缩流在 pipe 接上之前就结束，数据全丢、连接挂到超时。
+              z.pipe(res);
+              z.end(body);
             } else {
               res.writeHead(proxyRes.statusCode ?? 502, out);
               res.end(body);

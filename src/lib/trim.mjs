@@ -1,22 +1,127 @@
-// 大响应裁剪：把 transcript / messages 这类响应里的巨型字符串截断。
+// 大响应瘦身：**只压缩工具截图，文字一个字符都不动**。
 //
-// 为什么需要：
-//   Desktop 的 /transcript 会把整条 turn 的每个 step 的 frames 全量返回，
-//   而 frames[].output 是工具执行的**完整输出**（读文件、跑命令、模型帧）。
-//   实测一个会话：transcript 总计 30.87 MB，其中 frames 占 30.81 MB（99.8%）。
-//   手机在 5G 下拉 30MB，前端 fetch 的 30s 超时就先到 —— 表现就是
-//   「HTTP 200 已收到，但 parse 阶段 Failed to fetch」。
+// 来龙去脉（这段历史值得留着，因为踩过一次方向性错误）：
+//   1.0 阶段遇到「手机打开长会话报 Failed to fetch，但 HTTP 状态是 200」。
+//   当时的判断是「响应太大」，于是按总预算对折所有字符串 —— 结果一个会话里
+//   5 MB 的 base64 截图没降下来多少，反倒把 846 字符的正文砍成了 41 字符。
+//   用户看到的就是「回复正文被吃掉、只剩一行省略号」。
 //
-// 设计约束：
-//   1. 只截断「字符串」，不改变 JSON 结构 —— 前端反序列化永远成功
-//   2. 保留首尾（工具输出通常结论在末尾），中间用可读标记代替
-//   3. 不动桌面端数据，只在传输层做投影；电脑上仍可看到全文
-//   4. 流式（text/event-stream）与非 JSON 一律放过
+//   后来逐字段统计才看清真相：单个长会话 /messages 共 5.41 MB，
+//   其中 imageUrl.url（截图的 base64 PNG）占 5.36 MB = 99.1%，
+//   而全部对话文字加起来不到 50 KB；/transcript 更极端 ——
+//   51 MB 里 48.6 MB 是 38 张截图（95.4%），文字只有 1.95 MB。
+//
+//   所以正确的做法是：**只动图片**。图片是有损也无所谓的呈现层，
+//   降分辨率后照样看得清；文字少一个字都可能改变语义，不能碰。
+//
+// 现在的行为：
+//   - 两阶段：先同步扫描出所有 PNG data URL，再异步并行压缩，最后同步组装
+//   - 其余任何字符串（正文、思考、工具输出、命令行）**原样保留**
+//   - 结构、字段名、数组长度全部不变
+//   - 没有任何「总预算」逻辑 —— 不再为了凑体积而牺牲内容
+//
+// 性能：
+//   - 图片本体压缩跑在 worker 线程（见 image-async.mjs），主线程不被阻塞
+//   - 结果按内容哈希缓存；同一会话第二次打开 ~20ms
+
+import crypto from 'node:crypto';
+
+import { shrinkAsync, clearAsyncCaches, shutdownWorkers, poolStats } from './image-async.mjs';
 
 const DEFAULT_PATH_HINTS = ['transcript', 'messages'];
 
+// ---------------------------------------------------------------- 缓存
+
+const responseCache = new Map(); // key: sha256(响应 buffer) -> { buffer, stats }
+let responseBytes = 0;
+const RESPONSE_CACHE_MAX_BYTES = 128 * 1024 * 1024;
+const RESPONSE_CACHE_MAX_ENTRIES = 32;
+
+function hash(buf) {
+  return crypto.createHash('sha256').update(buf).digest('base64');
+}
+
+function lruGet(map, key) {
+  const v = map.get(key);
+  if (v === undefined) return undefined;
+  map.delete(key);
+  map.set(key, v);
+  return v;
+}
+
+function lruSet(map, key, value, sizeFn, { maxBytes, maxEntries }, counter) {
+  if (map.has(key)) {
+    counter.bytes -= sizeFn(map.get(key));
+    map.delete(key);
+  }
+  map.set(key, value);
+  counter.bytes += sizeFn(value);
+  while (map.size > maxEntries || counter.bytes > maxBytes) {
+    const firstKey = map.keys().next().value;
+    if (firstKey === undefined) break;
+    counter.bytes -= sizeFn(map.get(firstKey));
+    map.delete(firstKey);
+  }
+}
+
+const respBytes = { bytes: 0 };
+
+// ---------------------------------------------------------------- 并发闸门
+//
+// 真实事故：前端会在会话打开时**并发**打多个 /transcript（实测一次 13 个）。
+// 每个都是 51MB、31 张图。如果任由它们同时进来：
+//   - 4 个 worker 被抢爆，每个请求排队等 CPU
+//   - 主线程同时持有 13 × 51MB = 663MB 的 Buffer
+//   - 结果全都超时，页面永远「加载中」
+//
+// 所以必须限流：同一时刻只处理 N 个瘦身任务，其余排队。
+// 排队时上游流**不读取**，靠 TCP 背压把压力推回 Desktop —— 内存不会爆。
+const MAX_CONCURRENT_TRIM = 2;
+let running = 0;
+const waiting = [];
+const inflightResponses = new Map(); // respKey -> Promise<{buffer,stats}|null>
+
+function acquireSlot() {
+  if (running < MAX_CONCURRENT_TRIM) {
+    running += 1;
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => waiting.push(resolve));
+}
+
+function releaseSlot() {
+  const next = waiting.shift();
+  if (next) {
+    next(); // 名额直接转交，running 不变
+  } else {
+    running -= 1;
+  }
+}
+
+/** 清空缓存（测试用） */
+export async function clearCaches() {
+  responseCache.clear();
+  responseBytes = 0;
+  respBytes.bytes = 0;
+  clearAsyncCaches();
+}
+
+/** 缓存现状（诊断用） */
+export function cacheStats() {
+  return {
+    responseEntries: responseCache.size,
+    responseBytes: respBytes.bytes,
+    ...poolStats(),
+  };
+}
+
+/** 进程退出时收尾（测试用） */
+export async function shutdown() {
+  await shutdownWorkers();
+}
+
 /**
- * 这条响应是否值得裁剪。
+ * 这条响应是否值得处理。
  * @returns {boolean}
  */
 export function shouldTrim(req, upstreamRes, cfg) {
@@ -26,7 +131,7 @@ export function shouldTrim(req, upstreamRes, cfg) {
   const ct = String(upstreamRes.headers['content-type'] ?? '');
   if (!/^application\/json\b/i.test(ct)) return false;
 
-  // 上游已编码的不碰（我们无法在压缩流上做 JSON 处理）
+  // 上游已编码的不碰（无法在压缩流上做 JSON 处理）
   if (upstreamRes.headers['content-encoding']) return false;
 
   const len = Number(upstreamRes.headers['content-length'] ?? 0);
@@ -41,69 +146,109 @@ export function shouldTrim(req, upstreamRes, cfg) {
   return cfg.paths.some((hint) => pathname.includes(String(hint).toLowerCase()));
 }
 
+const MAX_DEPTH = 64;
+
 function fmt(n) {
   return n.toLocaleString('en-US');
 }
 
 /**
- * 把长字符串截成 head + 标记 + tail。
- * 保留末尾很重要：命令输出/文件内容的结论通常在尾部。
+ * 阶段一：同步扫描，找出所有需要压缩的 PNG data URL。
+ *
+ * 顺手把「相同内容只记一次」做了 —— 同一个会话里同一张截图可能被引用多次，
+ * 压缩一次就够。
  */
-function truncateString(s, maxChars, budget) {
-  if (s.length <= maxChars) return s;
-
-  const headLen = Math.max(1, Math.floor(maxChars * 0.6));
-  const tailLen = Math.max(1, Math.floor(maxChars * 0.28));
-  const head = s.slice(0, headLen);
-  const tail = s.slice(-tailLen);
-  const omitted = s.length - head.length - tail.length;
-
-  budget.omittedChars += omitted;
-  budget.fields += 1;
-
-  return (
-    head +
-    `\n\n…[已省略 ${fmt(omitted)} 字符 / 原长 ${fmt(s.length)}；` +
-    `完整内容请在电脑上查看]…\n\n` +
-    tail
-  );
+function collectImages(value, cfg, found, seen, depth = 0) {
+  if (depth > MAX_DEPTH) return;
+  if (typeof value === 'string') {
+    // 快速排除：绝大多数字符串连前缀都不匹配，不做任何额外工作
+    if (value.length < cfg.image.minChars) return;
+    if (!value.startsWith('data:image/png;base64,')) return;
+    if (seen.has(value)) return;
+    seen.add(value);
+    found.push(value);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i += 1) collectImages(value[i], cfg, found, seen, depth + 1);
+    return;
+  }
+  if (value && typeof value === 'object') {
+    for (const k of Object.keys(value)) collectImages(value[k], cfg, found, seen, depth + 1);
+  }
 }
 
-const MAX_DEPTH = 24;
-
-/** 深度遍历，只压字符串，结构不变。 */
-function trimValue(value, maxChars, budget, depth = 0) {
+/**
+ * 阶段二：同步组装，把命中的图片换掉。
+ * map 的 key 是压缩后的结果（可能为 null 表示原样放过）。
+ */
+function applyImages(value, results, stats, depth = 0) {
   if (depth > MAX_DEPTH) return value;
-  if (typeof value === 'string') return truncateString(value, maxChars, budget);
+
+  if (typeof value === 'string') {
+    const res = results.get(value);
+    if (res === undefined) return value; // 没扫描到的（太短或不是 PNG）
+    if (!res) return value; // 扫描到了但决定不压缩
+
+    stats.images += 1;
+    stats.originalImageBytes += res.originalBytes;
+    stats.outImageBytes += res.outBytes;
+    stats.details.push({
+      factor: res.factor,
+      from: `${res.width}x${res.height}`,
+      to: `${res.outWidth}x${res.outHeight}`,
+      before: res.originalBytes,
+      after: res.outBytes,
+    });
+    return res.url;
+  }
 
   if (Array.isArray(value)) {
+    let changed = false;
     const out = new Array(value.length);
     for (let i = 0; i < value.length; i += 1) {
-      out[i] = trimValue(value[i], maxChars, budget, depth + 1);
+      out[i] = applyImages(value[i], results, stats, depth + 1);
+      if (out[i] !== value[i]) changed = true;
     }
-    return out;
+    return changed ? out : value;
   }
 
   if (value && typeof value === 'object') {
+    let changed = false;
     const out = {};
     for (const k of Object.keys(value)) {
-      out[k] = trimValue(value[k], maxChars, budget, depth + 1);
+      out[k] = applyImages(value[k], results, stats, depth + 1);
+      if (out[k] !== value[k]) changed = true;
     }
-    return out;
+    return changed ? out : value;
   }
 
   return value;
 }
 
 /**
- * 裁剪一个 JSON Buffer。
+ * 瘦身一个 JSON Buffer（异步版）。
  *
- * 会先按 cfg.maxChars 截断；如果结果仍超 cfg.totalBytes，就把 maxChars
- * 逐级对折重试（最多 4 轮），保证最终一定落在预算内。
+ * 只压缩 base64 PNG 截图；文字内容与 JSON 结构完全不变。
  *
- * @returns {{ buffer: Buffer, stats: object } | null} null 表示放弃裁剪
+ * @returns {Promise<{ buffer: Buffer, stats: object } | null>}
+ *          null 表示「不改动，原样放过」
  */
-export function trimJsonBuffer(buf, cfg) {
+export async function trimJsonBuffer(buf, cfg) {
+  const originalBytes = buf.length;
+
+  // ---- 整响应缓存 ----
+  // 手机每次进会话都会重新 fetch 同一个 /messages。内容没变时直接复用上次结果，
+  // 省掉「JSON 解析 + 遍历 + 序列化」的全部开销（51MB 的 transcript 从 3s 降到 20ms）。
+  const respKey = hash(buf);
+  const cachedResp = lruGet(responseCache, respKey);
+  if (cachedResp !== undefined) {
+    return {
+      buffer: cachedResp.buffer,
+      stats: { ...cachedResp.stats, cachedResponse: true },
+    };
+  }
+
   let parsed;
   try {
     parsed = JSON.parse(buf.toString('utf8'));
@@ -111,58 +256,85 @@ export function trimJsonBuffer(buf, cfg) {
     return null; // 不是合法 JSON，原样放过
   }
 
-  const originalBytes = buf.length;
-  let maxChars = cfg.maxChars;
-  let best = null;
+  // 阶段一：找出所有候选图片（轻量，同步）
+  const found = [];
+  collectImages(parsed, cfg, found, new Set(), 0);
+  if (found.length === 0) return null; // 没有图片 → 不需要动
 
-  for (let attempt = 0; attempt < 4; attempt += 1) {
-    const budget = { omittedChars: 0, fields: 0 };
-    const trimmed = trimValue(parsed, maxChars, budget);
-    const out = Buffer.from(JSON.stringify(trimmed), 'utf8');
-
-    best = {
-      buffer: out,
-      stats: {
-        originalBytes,
-        trimmedBytes: out.length,
-        omittedChars: budget.omittedChars,
-        fields: budget.fields,
-        maxChars,
-        attempts: attempt + 1,
-        overBudget: false,
-      },
-    };
-
-    if (out.length <= cfg.totalBytes) return best;
-
-    // 还没达标：按「实际超出比例」估算下一轮 maxChars。
-    // 直接除以 3 在字段数很多时会不够（每轮只砍字符串，砍不动结构），
-    // 这里用比例外推，通常 2~3 轮收敛。
-    const over = out.length / cfg.totalBytes;
-    const next = Math.floor(maxChars / Math.max(1.6, over * 1.15));
-    maxChars = Math.max(48, next);
+  // ---- 合并重复请求 ----
+  // 前端会并发打同一个 /transcript（实测一次 13 个一模一样的请求）。
+  // 第一个进来算，其余的等它的结果，避免重复烧 CPU。
+  const pending = inflightResponses.get(respKey);
+  if (pending !== undefined) {
+    const shared = await pending;
+    return shared === null ? null : { buffer: shared.buffer, stats: { ...shared.stats, deduped: true } };
   }
 
-  // 兜底：如果逐级对折仍没进预算，说明单字段都不是瓶颈、而是字段太多
-  // （JSON 骨架本身就接近预算）。此时把 maxChars 压到最小值再试一次；
-  // 若仍超，就用 overBudget 显式标记 —— 宁可超预算，也不能让前端崩。
-  if (best && best.buffer.length > cfg.totalBytes) {
-    const budget = { omittedChars: 0, fields: 0 };
-    const trimmed = trimValue(parsed, 48, budget);
-    const out = Buffer.from(JSON.stringify(trimmed), 'utf8');
-    return {
-      buffer: out,
-      stats: {
-        originalBytes,
-        trimmedBytes: out.length,
-        omittedChars: budget.omittedChars,
-        fields: budget.fields,
-        maxChars: 48,
-        attempts: 5,
-        overBudget: out.length > cfg.totalBytes,
-      },
-    };
-  }
+  const task = (async () => {
+    await acquireSlot();
+    try {
+      // 阶段二：并行压缩（worker 线程，主线程不被阻塞）
+      const results = new Map();
+      await Promise.all(
+        found.map(async (url) => {
+          const res = await shrinkAsync(url, cfg.image);
+          if (res) results.set(url, res);
+        }),
+      );
 
-  return best;
+      if (results.size === 0) return null; // 一张都没压成
+
+      const stats = {
+        originalBytes,
+        trimmedBytes: originalBytes,
+        images: 0,
+        originalImageBytes: 0,
+        outImageBytes: 0,
+        cachedResponse: false,
+        details: [],
+      };
+
+      // 阶段三：同步组装
+      const slim = applyImages(parsed, results, stats, 0);
+      const out = Buffer.from(JSON.stringify(slim), 'utf8');
+      stats.trimmedBytes = out.length;
+
+      lruSet(responseCache, respKey, { buffer: out, stats }, (e) => e.buffer.length, {
+        maxBytes: RESPONSE_CACHE_MAX_BYTES,
+        maxEntries: RESPONSE_CACHE_MAX_ENTRIES,
+      }, respBytes);
+
+      return { buffer: out, stats };
+    } finally {
+      releaseSlot();
+    }
+  })();
+
+  inflightResponses.set(respKey, task);
+  try {
+    return await task;
+  } finally {
+    inflightResponses.delete(respKey);
+  }
+}
+
+/** 给日志用的一句话摘要。 */
+export function formatStats(stats) {
+  const saved = stats.originalImageBytes - stats.outImageBytes;
+  const pct = stats.originalImageBytes > 0
+    ? ((saved / stats.originalImageBytes) * 100).toFixed(1)
+    : '0.0';
+  const factors = [...new Set(stats.details.map((d) => d.factor))].sort((a, b) => a - b);
+  const detail = factors.length ? `÷${factors.join('/')}` : '';
+  const size = stats.details.length
+    ? `${stats.details[0].from}→${stats.details[0].to}`
+    : '';
+  const respHit = stats.cachedResponse ? '，整响应缓存命中' : '';
+  return (
+    `图片 ${stats.images} 张 ${(stats.originalImageBytes / 1024 / 1024).toFixed(2)}MB → ` +
+    `${(stats.outImageBytes / 1024).toFixed(0)}KB（−${pct}%）` +
+    (size ? ` [${size} ${detail}]` : '') +
+    `；正文原样保留 ${fmt(stats.originalBytes - stats.originalImageBytes)} 字节` +
+    respHit
+  );
 }
