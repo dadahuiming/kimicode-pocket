@@ -137,7 +137,7 @@ function makeEl(tag = 'div', attrs = {}) {
  * 「节点不够」而把胶囊藏起来 —— 那也能跑通，但测不出 key 计算的路径。
  * 这里给三条真实轮次，正好走到 keyFor() → sidFromPath()。
  */
-function makeEnv({ pathname = '/sessions/session_test-0001' } = {}) {
+function makeEnv({ pathname = '/sessions/session_test-0001', nativeToc: nativeTocSpec = null } = {}) {
   const body = makeEl('body');
   const workbar = makeEl('div');
   workbar.className = 'dock-workbar';
@@ -172,6 +172,28 @@ function makeEnv({ pathname = '/sessions/session_test-0001' } = {}) {
 
   const all = [workbar, card, scrollerEl, ...bubbles];
 
+  // 桌面自带的目录。默认「不存在」—— 窄屏（手机）下 Desktop 根本不渲染它。
+  // 需要模拟 iPad / 折叠屏时由测试塞进来（见 opts.nativeToc）。
+  let nativeToc = null;
+  if (nativeTocSpec) {
+    nativeToc = makeEl('nav');
+    nativeToc.className = 'conversation-toc';
+    nativeToc._attrs.class = 'conversation-toc';
+    // 关键：Desktop 在窄容器里**仍然留着这个元素**，只是 visibility:hidden。
+    // offsetParent 对 visibility:hidden 依然非 null（这是这个 bug 的成因）。
+    nativeToc.offsetParent = nativeTocSpec.offsetParent === false ? null : body;
+    nativeToc.getBoundingClientRect = () => fakeRect(
+      nativeTocSpec.top ?? 400,
+      nativeTocSpec.right ?? 700,
+      nativeTocSpec.width ?? 13,
+      nativeTocSpec.height ?? 59,
+    );
+    nativeToc._computed = {
+      visibility: nativeTocSpec.visibility || 'visible',
+      display: nativeTocSpec.display || 'flex',
+    };
+  }
+
   // localStorage：真的存，注入脚本会读会写
   const store = new Map();
   const localStorage = {
@@ -204,7 +226,7 @@ function makeEnv({ pathname = '/sessions/session_test-0001' } = {}) {
       if (sel === '.dock-workbar') return workbar;
       if (sel === '.composer-card' || sel === '.composer') return card;
       if (sel === '.panes.chat-scroll') return scrollerEl;
-      if (sel === '.conversation-toc') return null;
+      if (sel === '.conversation-toc') return nativeToc;
       return null;
     },
     querySelectorAll(sel) {
@@ -229,10 +251,15 @@ function makeEnv({ pathname = '/sessions/session_test-0001' } = {}) {
     location: { pathname, href: 'https://example.test' + pathname, origin: 'https://example.test' },
     document: doc,
     localStorage,
-    getComputedStyle: () => ({
-      display: 'block', visibility: 'visible', opacity: '1', pointerEvents: 'auto',
-      position: 'static', overflowY: 'visible', overflowX: 'visible',
-    }),
+    // 按元素返回：nativeToc 可以带自己的 visibility（模拟 .toc-clipped）
+    getComputedStyle: (el) => {
+      const base = {
+        display: 'block', visibility: 'visible', opacity: '1', pointerEvents: 'auto',
+        position: 'static', overflowY: 'visible', overflowX: 'visible',
+      };
+      if (el && el._computed) return { ...base, ...el._computed };
+      return base;
+    },
     addEventListener() {},
     removeEventListener() {},
     requestAnimationFrame: (fn) => setTimeout(fn, 0),
@@ -271,9 +298,9 @@ function makeEnv({ pathname = '/sessions/session_test-0001' } = {}) {
  * 同步断言时 localStorage 还是空的（第一版就误判成「一条都没写」）。
  * 这里把 setTimeout 夹到 5ms，然后等 40ms 让它跑完。
  */
-async function runClient({ pathname } = {}) {
+async function runClient({ pathname, nativeToc } = {}) {
   const code = clientCode();
-  const env = makeEnv({ pathname });
+  const env = makeEnv({ pathname, nativeToc });
   const errors = [];
   // vm 里抛出的 ReferenceError 会直接冒出来 —— 这正是我们要抓的
   const ctx = vm.createContext(env.win);
@@ -393,6 +420,63 @@ test('注入脚本：写进 localStorage 的 key 是 s:<id>，不是裸 pathname
     keys.every((k) => k.startsWith('kimi-pocket.toc.s:session_test-0001')),
     '缓存 key 形态不对：' + JSON.stringify(keys),
   );
+});
+
+// ---- 响应式可见性：折叠屏 / iPad / 阔直板 --------------------------------
+//
+// 用户报的：「折叠屏会不会显示出来？我怕你只限制在直屏机上了，
+// 没有兼顾 iPad、折叠机、阔直板」—— 这个担心是对的，实测确实有 bug。
+//
+// Desktop 的 ConversationToc 判定是
+//     g = 父容器右边界 - 目录左边界 - 12
+//     g >= 160 ? 显示 : 加 .toc-clipped → visibility:hidden
+// 但它在**任何宽度下都留在 DOM 里**。而 offsetParent 对 visibility:hidden
+// 的元素依然非 null（visibility 不参与布局）。所以早先的
+//     nativeVisible = native.offsetParent !== null
+// 在 700~1280px 恒为 true：胶囊躲起来，桌面目录却看不见 —— 两边全空。
+// 这几条用例就是钉住这个区间。
+
+/** 取胶囊根节点 */
+function rootOf(env) {
+  return env.body.children.find((c) => c._attrs && c._attrs.id && String(c._attrs.id).includes('pocket-turn-nav'));
+}
+
+test('响应式：手机直屏（桌面目录不存在）→ 胶囊显示', async () => {
+  const { errors, env } = await runClient({ nativeToc: null });
+  assert.deepEqual(errors.map((e) => e.message), []);
+  assert.ok(rootOf(env).classList.contains('on'), '手机窄屏下胶囊必须显示');
+});
+
+test('响应式：折叠屏展开 / iPad（桌面目录在 DOM 里但 visibility:hidden）→ 胶囊必须显示', async () => {
+  // 这是线上真实踩到的场景：元素存在、offsetParent 非 null、但用户看不见
+  const { errors, env } = await runClient({
+    nativeToc: { visibility: 'hidden', width: 13, height: 59 },
+  });
+  assert.deepEqual(errors.map((e) => e.message), []);
+  assert.ok(
+    rootOf(env).classList.contains('on'),
+    '桌面目录 visibility:hidden 时胶囊仍然躲起来了 —— 折叠屏/iPad 上会两边都看不见',
+  );
+});
+
+test('响应式：桌面目录真的可见 → 胶囊让位（不重复显示）', async () => {
+  const { errors, env } = await runClient({
+    nativeToc: { visibility: 'visible', width: 13, height: 59 },
+  });
+  assert.deepEqual(errors.map((e) => e.message), []);
+  assert.equal(
+    rootOf(env).classList.contains('on'),
+    false,
+    '桌面目录可见时胶囊不该抢位置',
+  );
+});
+
+test('响应式：桌面目录尺寸为 0 → 视为不可见，胶囊显示', async () => {
+  const { errors, env } = await runClient({
+    nativeToc: { visibility: 'visible', width: 0, height: 0 },
+  });
+  assert.deepEqual(errors.map((e) => e.message), []);
+  assert.ok(rootOf(env).classList.contains('on'), '零尺寸的目录不算可见，胶囊要显示');
 });
 
 test('sessionIdFromPath：模块侧与注入侧行为一致', () => {

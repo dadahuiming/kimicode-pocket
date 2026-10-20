@@ -1878,9 +1878,33 @@ const CLIENT_JS = String.raw`
       if (sc) recordFromDom(sc);
       maybePreload();
 
-      // 桌面端有自己的目录（>640px 时渲染），别让两条同时出现
+      // 桌面端有自己的目录 —— 但**只有它真的能看见时**才让位。
+      //
+      // 这里踩过一个很难发现的坑（用户报的：「折叠屏/iPad 上历史节点不显示」）：
+      // Desktop 的 ConversationToc 组件在窄容器里**仍然留在 DOM 里**，
+      // 只是加了 .toc-clipped → visibility:hidden。它的判定是
+      //     g = 父容器右边界 - 目录左边界 - 12
+      //     g >= 160 ? 可见 : 加 toc-clipped
+      // 而 offsetParent 对 visibility:hidden 的元素**依然非 null**
+      // （visibility 不影响布局，只影响绘制）。
+      //
+      // 于是早先的 offsetParent 判断在 700~1280px 区间恒为 true：
+      // 胶囊以为「桌面目录在显示」而躲起来，可桌面目录其实是
+      // visibility:hidden —— **两边都看不见**，功能整个消失。
+      // 受影响的正是折叠屏展开（~700-900）、iPad 竖屏（768/820）、
+      // iPad 横屏（1024/1180）、阔直板（~900-1000）。
+      //
+      // 正确判据：offsetParent（在文档里）+ 自身和祖先都没被 visibility
+      // 隐藏 + 真的有尺寸。getComputedStyle 会继承祖先的 visibility，
+      // 所以直接读它一个就够。
       var native = document.querySelector('.conversation-toc');
-      var nativeVisible = native && native.offsetParent !== null;
+      var nativeVisible = false;
+      if (native && native.offsetParent !== null) {
+        var ncs = window.getComputedStyle ? window.getComputedStyle(native) : null;
+        var nr = native.getBoundingClientRect();
+        nativeVisible = (!ncs || (ncs.visibility !== 'hidden' && ncs.display !== 'none'))
+          && nr.width > 1 && nr.height > 1;
+      }
       overlayOn = overlayOpen();
       var enough = chatRendered && knownIds().length > 1;
       root.classList.toggle('on', placeOk && !nativeVisible && enough);
