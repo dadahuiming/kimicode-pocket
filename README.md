@@ -11,7 +11,7 @@
 [![Cloudflare Tunnel](https://img.shields.io/badge/Cloudflare-Tunnel-F38020?logo=cloudflare&logoColor=white)](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-0078D6)](#平台适配)
-[![Tests](https://img.shields.io/badge/tests-259%20passing-brightgreen)](#开发与测试)
+[![Tests](https://img.shields.io/badge/tests-271%20passing-brightgreen)](#开发与测试)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)](package.json)
 [![No Subscription](https://img.shields.io/badge/subscription-not%20required-success)](#和官方远程控制的区别)
 

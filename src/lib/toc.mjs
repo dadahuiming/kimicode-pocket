@@ -1,7 +1,6 @@
 // 历史节点（Turn Navigator / History Nodes）
 //
-// ---- 为什么需要它 ----------------------------------------------------------
-// 桌面端右侧有一条「对话目录」（ConversationToc）：每轮提问一根小竖条，
+// ---- 为什么需要它 ----------------------------------------------------------// 桌面端右侧有一条「对话目录」（ConversationToc）：每轮提问一根小竖条，
 // 当前轮加长，点一下跳过去。手机上没有，因为它被一条媒体查询挡住了：
 //
 //     const u = D(() => !n.mobile && !n.sessionLoading && n.items.length > 1)
@@ -46,7 +45,12 @@
 //   - 找不到锚点 → 自己不渲染，不影响原页面
 //   - 宿主页面用 data-color-scheme 表达明暗（与 Kimi 自己的 _u 体系一致）
 
+import { buildReconnectScript } from './reconnect.mjs';
+
 export const TOC_SCRIPT_ID = 'pocket-turn-nav-script';
+
+/** 断线提示改写脚本的 id（与胶囊分开，便于单独排查） */
+export const RECONNECT_SCRIPT_ID = 'pocket-reconnect-script';
 
 /** 注入标记：测试和排障时用来确认「注入确实发生了」 */
 export const TOC_MARKER = `<!-- kimi-pocket:turn-nav -->`;
@@ -111,11 +115,19 @@ export function alreadyInjected(html) {
  * @param {string} html 上游返回的 HTML
  * @returns {string}
  */
-export function injectTurnNav(html) {
+export function injectTurnNav(html, { reconnect = true } = {}) {
   if (typeof html !== 'string' || html.length === 0) return html;
   if (alreadyInjected(html)) return html;
 
-  const snippet = TOC_MARKER + buildScriptTag();
+  // 两段脚本互相独立：
+  //   - 断线提示改写（reconnect）—— 见 lib/reconnect.mjs
+  //   - 历史节点胶囊（toc）
+  // 放在同一个 snippet 里，是因为注入点只有一处；两者失败互不影响
+  // （各自都是完整 IIFE，各自 try 保护）。
+  const reconnectTag = reconnect
+    ? `<script id="${RECONNECT_SCRIPT_ID}">${buildReconnectScript().replace(/<\/script/gi, '<\\/script')}</script>`
+    : '';
+  const snippet = TOC_MARKER + reconnectTag + buildScriptTag();
   const lower = html.toLowerCase();
 
   const bodyEnd = lower.lastIndexOf('</body>');

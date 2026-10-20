@@ -65,7 +65,7 @@ const CREDENTIAL_TTL_DAYS = 7;
 const MAX_LOG_BYTES = 5 * 1024 * 1024;
 const LOG_FLUSH_MS = 500;
 const LOG_FLUSH_LINES = 64;
-const VERSION = '1.6.13';
+const VERSION = '1.6.14';
 
 const HELP = `KimiCode Pocket ${VERSION}
 
