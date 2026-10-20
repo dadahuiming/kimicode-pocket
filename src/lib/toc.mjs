@@ -155,12 +155,24 @@ function buildScriptTag() {
 // **直接单测** —— 注入脚本是一整个 IIFE，在 Node 里跑它需要伪造整套 DOM，
 // 太脆。下面 CLIENT_JS 里会原样复用这同一份实现。
 
-const SESSION_PATH_RE = '/sessions/';
+// ⚠️ 这个前缀必须写在函数**里面**，不能提到模块作用域。
+//
+// 下面的函数会被 .toString() 抽出来**原样注入**浏览器（见 CLIENT_HELPERS）。
+// 一旦引用模块级变量，注入出去的代码里就只有 `SESSION_PATH_RE` 这个名字，
+// 而浏览器里根本没有它 —— 第一次调用就抛
+//     ReferenceError: SESSION_PATH_RE is not defined
+// 后果是整个注入 IIFE 在 boot() 里死掉：胶囊永远不出现，控制台一行红字。
+// 而 `new Function(code)` 只查语法、不查自由变量，测试全绿也发现不了。
+//
+// 这不是假设：v1.6.12 就是这么发出去的，线上胶囊彻底消失。
+// 现在的护栏是 test/toc-inject.test.mjs —— 它把注入脚本真的跑一遍。
 
 /** 从 pathname 里取出会话 id；取不到返回 '' */
 export function sessionIdFromPath(p) {
-  if (!p || p.indexOf(SESSION_PATH_RE) !== 0) return '';
-  const rest = p.slice(SESSION_PATH_RE.length);
+  // 常量写死在函数体内：注入后必须自给自足（见上面的警告）
+  const prefix = '/sessions/';
+  if (!p || p.indexOf(prefix) !== 0) return '';
+  const rest = p.slice(prefix.length);
   // 带子路径（/sessions/<id>/children 之类）不算会话页
   if (!rest || rest.indexOf('/') >= 0) return '';
   try {
