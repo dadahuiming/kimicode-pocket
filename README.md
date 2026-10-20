@@ -2,7 +2,7 @@
 
 # KimiCode Pocket
 
-**把 Kimi Code Desktop 的 Web UI 装进你的口袋——手机浏览器直接远控，零安装。**
+**把 Kimi Code Desktop 的 Web UI 装进你的口袋——手机浏览器直接远控，零安装、零依赖、零订阅。**
 
 <p align="center"><b>中文</b> | <a href="README.en.md">English</a></p>
 
@@ -11,10 +11,44 @@
 [![Cloudflare Tunnel](https://img.shields.io/badge/Cloudflare-Tunnel-F38020?logo=cloudflare&logoColor=white)](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-0078D6)](#平台适配)
-[![Tests](https://img.shields.io/badge/tests-183%20passing-brightgreen)](#开发与测试)
+[![Tests](https://img.shields.io/badge/tests-249%20passing-brightgreen)](#开发与测试)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)](package.json)
+[![No Subscription](https://img.shields.io/badge/subscription-not%20required-success)](#和官方远程控制的区别)
 
 </div>
+
+---
+
+## 和官方远程控制的区别
+
+Kimi 官方有「远程控制」（`kimi rc` / Settings → Remote Control），但它有**三个前提**：
+要**付费会员**、要**登录同一个 Kimi 账号**、要经 **Kimi 服务中转**。
+
+本项目走的是完全不同的路：**直接把你电脑上已经开着的 Desktop Web UI 反代到公网**。
+
+| | Kimi 官方远程控制 | **KimiCode Pocket** |
+|---|---|---|
+| **订阅要求** | ❌ 需要付费会员<br><sub>官方文档原文：「远程控制需要会员权限，免费用户无法使用」</sub> | ✅ **不需要任何订阅**<br><sub>用的是你本机 Desktop 已有的 Web UI，不经过 Kimi 服务</sub> |
+| **鉴权方式** | 登录同一个 Kimi 账号 | 一次性配对码（180 秒 / 用后即焚）+ 可选 PIN |
+| **流量路径** | 经 Kimi 服务中转 | 你自己的 Cloudflare 隧道，**点对点** |
+| **界面** | 官方远程控制界面 | **完整的 Desktop Web UI**（一模一样，含历史节点、截图、工具调用） |
+| **部署** | 开关一开即可 | **一条命令**（见下） |
+| **依赖** | Kimi App / 浏览器 + 账号 | 只有 Node 22+，**零 npm 依赖** |
+
+> 官方文档：[远程控制 | Kimi Code](https://www.kimi.com/code/docs/kimi-code-cli/guides/remote-control.html)
+> ——「已登录 Kimi 账号且为付费会员：远程控制需要会员权限，免费用户无法使用」
+
+### 一键部署
+
+```bash
+# 克隆后直接跑，不需要 npm install（零依赖）
+node src/proxy.mjs --pair-only --base https://your-domain.com
+```
+
+终端会打印配对链接和二维码，手机扫一下就能用。要 7×24 常驻就再跑 `npm run watchdog`。
+
+**远程公网连接**：通过 Cloudflare Tunnel 暴露，不需要公网 IP、不需要开路由器端口、不需要 DDNS。
+用自己的域名就是固定地址（本项目作者用的是 `kimicode.damingtop.online`）。
 
 > ## ⚠️ 非官方项目
 >
@@ -28,6 +62,7 @@
 
 ## 目录
 
+- [和官方远程控制的区别](#和官方远程控制的区别)
 - [这个项目解决什么问题](#这个项目解决什么问题)
 - [特性](#特性)
 - [前提约束（先读这一节）](#前提约束先读这一节)
@@ -1522,6 +1557,51 @@ Access 在隧道**之前**加一层身份验证，即使 URL 泄露也进不来�
 
 ## 运维：日志、状态与回滚
 
+### 桌面通知（Windows）
+
+代理出错时会弹 Windows 通知 —— 不用事后翻日志才发现出过事。
+
+**触发时机：**
+
+| 类别 | 具体事件 |
+|---|---|
+| 服务可用性 | 进程启动、进程非 0 退出（看门狗会重启） |
+| 请求失败 | 上游连不上、上游超时、上游传输中断、瘦身失败、响应过大未瘦身 |
+| 代码异常 | 未处理的 Promise 拒绝、未捕获异常（已被兜住、服务继续跑） |
+| 资源预警 | 内存超 1.5 GB / 2.5 GB、瘦身排队堆积 |
+
+**三条硬约束（实测逼出来的，改代码前请先读）：**
+
+1. **异步发送**。每次 Toast 约 **1000 ms**（起 powershell + WinRT）。
+   同步发会卡住正在服务的请求。
+2. **同类去重**。真实故障是一串相同错误，不去重会连弹几十个窗口，
+   用户会直接关掉通知 —— 那还不如没有。默认 5 分钟内同类只弹一次。
+3. **中文走 `-EncodedCommand`**（UTF-16LE base64）。
+   直接 `-Command` 传中文在部分场景会乱码。
+
+发送失败（powershell 不可用、非 Windows、WinRT 被禁）**全部静默吞掉**，
+只写日志。通知系统自己坏了不能拖垮代理。
+
+**配置：**
+
+| 环境变量 | 默认 | 说明 |
+|---|---|---|
+| `POCKET_NOTIFY` | `1` | `0` 彻底关闭 |
+| `POCKET_NOTIFY_DEDUPE_SEC` | `300` | 同类错误去重窗口（秒） |
+| `POCKET_NOTIFY_MIN_INTERVAL_MS` | `3000` | 任意两条通知的最小间隔 |
+| `POCKET_NOTIFY_MAX_PER_MIN` | `6` | 每分钟上限 |
+| `POCKET_NOTIFY_APPID` | `KimiCodePocket` | 通知归属标识 |
+| `POCKET_NOTIFY_RSS_WARN_MB` | `1536` | 内存预警阈值 |
+| `POCKET_NOTIFY_RSS_CRIT_MB` | `2560` | 内存严重阈值 |
+
+**排查「为什么没收到通知」**：看 `/__status` 的 `notify` 字段。
+
+```json
+"notify": { "enabled": true, "sent": 3, "deduped": 5, "throttled": 0, "failed": 0 }
+```
+
+`deduped` 高说明被同类去重挡了（正常）；`failed` 非 0 说明 powershell 那条路有问题。
+
 ### 日志位置
 
 **不在仓库里**，默认走平台状态目录（见[配置](#配置)）：
@@ -1993,7 +2073,8 @@ kimicode-pocket/
 │       ├── trim.mjs           # 大响应瘦身：只压截图，文字不动；并发闸门 + 缓存
 │       ├── toc.mjs            # 手机端历史节点：注入胶囊脚本（复用 data-turn-id）
 │       ├── image.mjs          # 零依赖 PNG 解码 / 箱式降采样 / 重编码
-│       ├── image-async.mjs    # worker 池调度 + 内容哈希去重
+│       ├── pool.mjs           # worker 池调度器（可注入，便于单测异常时序）
+│       ├── image-async.mjs    # 图片压缩调度 + 内容哈希去重 + LRU 结果缓存
 │       ├── image-worker.mjs   # worker 线程入口（PNG 压缩的 CPU 活）
 │       └── qr.mjs             # 零依赖二维码：SVG / 终端 / PNG
 ├── scripts/

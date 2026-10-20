@@ -59,10 +59,33 @@ export function rewriteRawHeaders(rawHeaders, port) {
   return out;
 }
 
-/** 回环来源判断（兼容 IPv4-mapped IPv6） */
+/**
+ * 回环来源判断（兼容 IPv4-mapped IPv6 的各种写法）。
+ *
+ * 实测 Node 在 `socket.remoteAddress` 上**总是给规范化后的形式**：
+ *   IPv4 连接 → "127.0.0.1"
+ *   IPv6 监听下的 IPv4 连接 → "::ffff:127.0.0.1"（全小写）
+ *   IPv6 loopback → "::1"
+ * 所以 `::FFFF:127.0.0.1`（大写）和 `0:0:0:0:0:0:0:1`（全展开）
+ * 实际上不会从 Node 冒出来。
+ *
+ * 但还是把它们都认了 —— 理由不是「现在会出问题」，而是这个函数是
+ * **安全判据**（决定要不要信任 CF-Connecting-IP），依赖「上游一定规范化」
+ * 这种隐含约定太脆：换 Node 版本、换反向代理、或者哪天有人把
+ * 代理链路改成 unix socket / 自定义 transport，都可能让形式变掉。
+ * 判错的后果是所有公网用户共享同一个限速桶（一个攻击者能锁住所有人）。
+ */
 export function isLoopbackAddr(addr) {
   if (!addr) return false;
-  return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1';
+  const s = String(addr).trim().toLowerCase();
+  if (s === '127.0.0.1' || s === '::1' || s === 'localhost') return true;
+  // IPv4-mapped：::ffff:127.0.0.1 以及十六进制写法 ::ffff:7f00:1
+  if (s === '::ffff:127.0.0.1' || s === '::ffff:7f00:1') return true;
+  // 全展开的 IPv6 loopback
+  if (s === '0:0:0:0:0:0:0:1') return true;
+  // 整个 127.0.0.0/8 都是回环（Linux 上常见 127.0.0.53 等）
+  if (/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(s)) return true;
+  return false;
 }
 
 /**
@@ -90,11 +113,24 @@ export function isLocalRequest(req) {
   return isLoopbackAddr(req?.socket?.remoteAddress) && !isTunneledRequest(req);
 }
 
-/** 从请求里推断客户端真实 IP（Cloudflare 会带 CF-Connecting-IP） */
+/**
+ * 从请求里推断客户端真实 IP。
+ *
+ * **只在来源可信时才看头**。CF-Connecting-IP / X-Forwarded-For 都是客户端
+ * 能自己写的：如果 `POCKET_BIND` 配成非回环（config 允许，只要配了 PIN），
+ * 攻击者绕过 Cloudflare 直连代理，每条请求换一个 X-Forwarded-For，
+ * 就能让 FailureLimiter 的「5 次/60 秒锁定」和 RateLimiter 的全局限速
+ * 同时失效 —— 于是 6 位 PIN 可以被无限猜。
+ *
+ * 判据：只有来源是回环（也就是确实由本机的 cloudflared 转发进来）时，
+ * 这些头才有意义。非回环来源一律用 socket 地址，头一概不信。
+ */
 export function clientIp(req) {
+  const remote = req.socket?.remoteAddress;
+  if (!isLoopbackAddr(remote)) return remote ?? 'unknown';
   const cf = req.headers['cf-connecting-ip'];
-  if (typeof cf === 'string' && cf) return cf.trim();
+  if (typeof cf === 'string' && cf.trim()) return cf.trim();
   const xff = req.headers['x-forwarded-for'];
-  if (typeof xff === 'string' && xff) return xff.split(',')[0].trim();
-  return req.socket?.remoteAddress ?? 'unknown';
+  if (typeof xff === 'string' && xff.trim()) return xff.split(',')[0].trim();
+  return remote ?? 'unknown';
 }

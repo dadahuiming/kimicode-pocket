@@ -2,7 +2,7 @@
 
 # KimiCode Pocket
 
-**Put Kimi Code Desktop's web UI in your pocket — control it from any phone browser, nothing to install on the phone.**
+**Put Kimi Code Desktop's web UI in your pocket — control it from any phone browser. No install, no dependencies, no subscription.**
 
 <p align="center"><b>English</b> | <a href="README.md">中文</a></p>
 
@@ -11,10 +11,49 @@
 [![Cloudflare Tunnel](https://img.shields.io/badge/Cloudflare-Tunnel-F38020?logo=cloudflare&logoColor=white)](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-0078D6)](#platform-parity)
-[![Tests](https://img.shields.io/badge/tests-183%20passing-brightgreen)](#development--testing)
+[![Tests](https://img.shields.io/badge/tests-249%20passing-brightgreen)](#development--testing)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)](package.json)
+[![No Subscription](https://img.shields.io/badge/subscription-not%20required-success)](#how-this-differs-from-official-remote-control)
 
 </div>
+
+---
+
+## How this differs from official Remote Control
+
+Kimi ships an official "Remote Control" (`kimi rc` / Settings → Remote Control),
+but it comes with **three requirements**: a **paid membership**, **signing in with the
+same Kimi account**, and traffic routed **through Kimi's service**.
+
+This project takes a different path entirely: it **reverse-proxies the Desktop web UI
+already running on your machine** out to the public internet.
+
+| | Official Remote Control | **KimiCode Pocket** |
+|---|---|---|
+| **Subscription** | ❌ Requires paid membership<br><sub>Official docs: "remote control requires membership; free users cannot use it"</sub> | ✅ **No subscription at all**<br><sub>It reuses the web UI your Desktop already serves — nothing goes through Kimi's service</sub> |
+| **Authentication** | Sign in with the same Kimi account | One-time pairing code (180 s, single-use) + optional PIN |
+| **Traffic path** | Relayed through Kimi's service | Your own Cloudflare Tunnel, **point-to-point** |
+| **Interface** | Official remote-control UI | **The full Desktop web UI** (identical — history nodes, screenshots, tool calls) |
+| **Setup** | Flip a switch | **One command** (below) |
+| **Dependencies** | Kimi App / browser + account | Node 22+ only, **zero npm dependencies** |
+
+> Official docs: [Remote Control | Kimi Code](https://www.kimi.com/code/docs/en/kimi-code-cli/guides/remote-control.html)
+> — "Signed in to a Kimi account with a paid membership: remote control requires
+> membership; free users cannot use it."
+
+### One-command deploy
+
+```bash
+# Clone and run — no npm install needed (zero dependencies)
+node src/proxy.mjs --pair-only --base https://your-domain.com
+```
+
+The terminal prints a pairing link and QR code; scan it with your phone and you're in.
+For 24/7 operation, also run `npm run watchdog`.
+
+**Public remote access**: exposed through Cloudflare Tunnel — no public IP, no router
+port-forwarding, no DDNS. With your own domain you get a fixed address (the author uses
+`kimicode.damingtop.online`).
 
 > ## ⚠️ Unofficial project
 >
@@ -30,6 +69,7 @@
 
 ## Table of contents
 
+- [How this differs from official Remote Control](#how-this-differs-from-official-remote-control)
 - [What problem does this solve](#what-problem-does-this-solve)
 - [Features](#features)
 - [Prerequisites (read this first)](#prerequisites-read-this-first)
@@ -1445,6 +1485,56 @@ Cloudflare dashboard → your domain → SSL/TLS and Security:
 
 ## Operations: logs, status, rollback
 
+### Desktop notifications (Windows)
+
+The proxy pops a Windows toast when something goes wrong — so you find out
+immediately instead of digging through logs afterwards.
+
+**When it fires:**
+
+| Category | Events |
+|---|---|
+| Availability | process started, process exited non-zero (watchdog will restart) |
+| Request failure | upstream unreachable, upstream timeout, upstream aborted mid-transfer, shrink failed, response too large to shrink |
+| Code faults | unhandled rejection, uncaught exception (caught, service keeps running) |
+| Resource warnings | RSS above 1.5 GB / 2.5 GB, shrink queue backing up |
+
+**Three hard constraints (all measured, read before changing the code):**
+
+1. **Send asynchronously.** Each toast costs ~**1000 ms** (spawning powershell
+   plus the WinRT call). Sending synchronously would stall a live request.
+2. **Deduplicate identical errors.** A real outage produces a *stream* of the
+   same error; without dedup you get dozens of popups, the user turns
+   notifications off, and you are back to zero observability.
+   Same class of error fires at most once per 5 minutes by default.
+3. **Send Chinese via `-EncodedCommand`** (UTF-16LE base64). Passing Chinese
+   through `-Command` mangles it in some contexts.
+
+Send failures (powershell missing, non-Windows, WinRT disabled) are **swallowed
+silently** and only logged. A broken notifier must never take down the proxy.
+
+**Configuration:**
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `POCKET_NOTIFY` | `1` | `0` disables entirely |
+| `POCKET_NOTIFY_DEDUPE_SEC` | `300` | dedup window per error class |
+| `POCKET_NOTIFY_MIN_INTERVAL_MS` | `3000` | minimum gap between any two toasts |
+| `POCKET_NOTIFY_MAX_PER_MIN` | `6` | per-minute cap |
+| `POCKET_NOTIFY_APPID` | `KimiCodePocket` | notification owner id |
+| `POCKET_NOTIFY_RSS_WARN_MB` | `1536` | memory warning threshold |
+| `POCKET_NOTIFY_RSS_CRIT_MB` | `2560` | memory critical threshold |
+
+**Debugging "why did I not get a notification"**: check the `notify` field of
+`/__status`.
+
+```json
+"notify": { "enabled": true, "sent": 3, "deduped": 5, "throttled": 0, "failed": 0 }
+```
+
+A high `deduped` means it was suppressed as a duplicate (normal); a non-zero
+`failed` means the powershell path is broken.
+
 ### Log locations
 
 **Not in the repo.** Defaults to the platform state directory (see
@@ -1829,7 +1919,8 @@ kimicode-pocket/
 │       ├── pairwatch.mjs      # terminal countdown + pairing status echo (stops on success)
 │       ├── trim.mjs           # large-response shrink: images only, text untouched; gate + caches
 │       ├── image.mjs          # zero-dependency PNG decode / box downscale / re-encode
-│       ├── image-async.mjs    # worker pool scheduling + content-hash dedup
+│       ├── pool.mjs           # worker pool scheduler (injectable, so edge timings are unit-testable)
+│       ├── image-async.mjs    # image shrink scheduling + content-hash dedup + LRU result cache
 │       ├── image-worker.mjs   # worker-thread entry (the CPU-bound PNG work)
 │       └── qr.mjs             # zero-dependency QR: SVG / terminal / PNG
 ├── scripts/

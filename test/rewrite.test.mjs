@@ -112,3 +112,46 @@ test('isLocalRequest：cloudflared 也是从 127.0.0.1 来的，必须靠 CF 头
   );
   assert.equal(isLocalRequest({ headers: {} }), false);
 });
+
+// ---- 回归：v1.6.12 审查发现的 IPv6 回环覆盖不足 ---------------------------
+
+test('isLoopbackAddr：IPv6 回环的各种写法都要认', () => {
+  // 这个函数是**安全判据** —— 它决定 clientIp 要不要信任
+  // CF-Connecting-IP / X-Forwarded-For。判错的后果是所有公网用户
+  // 共享同一个限速桶，一个攻击者就能把所有人锁在门外。
+  //
+  // 实测 Node 的 socket.remoteAddress 总是给规范化形式
+  // （::ffff:127.0.0.1 全小写 / ::1），所以下面这些变体实际上
+  // 不会从 Node 冒出来。但仍然要认 —— 不该让安全判据依赖
+  // 「上游一定规范化」这种隐含约定。
+  const loopbacks = [
+    '127.0.0.1',
+    '::1',
+    '::ffff:127.0.0.1',
+    '::FFFF:127.0.0.1', // 大写
+    '0:0:0:0:0:0:0:1', // 全展开
+    '::ffff:7f00:1', // IPv4-mapped 十六进制
+    '127.0.0.53', // Linux 常见的其它 127/8
+    'localhost',
+  ];
+  for (const a of loopbacks) {
+    assert.equal(isLoopbackAddr(a), true, `${a} 应该被认成回环`);
+  }
+});
+
+test('isLoopbackAddr：非回环一律 false（不能放宽）', () => {
+  const others = [
+    '10.0.0.1',
+    '192.168.1.1',
+    '2001:db8::1',
+    '0.0.0.0',
+    '128.0.0.1', // 127/8 之外
+    '::2',
+    '',
+    null,
+    undefined,
+  ];
+  for (const a of others) {
+    assert.equal(isLoopbackAddr(a), false, `${a} 不该被认成回环`);
+  }
+});

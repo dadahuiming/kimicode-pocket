@@ -37,7 +37,14 @@ import { loadConfig, ConfigError } from './lib/config.mjs';
 import { parseArgs, parsePairCount, MAX_PAIR_COUNT } from './lib/args.mjs';
 import { createDiscovery } from './lib/discovery.mjs';
 import { rewriteHeaders, rewriteRawHeaders, isLocalRequest, clientIp } from './lib/rewrite.mjs';
-import { shouldTrim, trimJsonBuffer, formatStats } from './lib/trim.mjs';
+import {
+  shouldTrim,
+  trimJsonBuffer,
+  formatStats,
+  acquireSlot,
+  releaseSlot,
+  slotStats,
+} from './lib/trim.mjs';
 import { injectTurnNav, shouldInjectNav, MAX_HTML_BYTES } from './lib/toc.mjs';
 import {
   newSessionToken,
@@ -50,6 +57,7 @@ import {
 import { loginPage, pairPage, pairRejectedPage, errorPage } from './lib/pages.mjs';
 import { encode as qrEncode, toPng as qrPng, toTerminal as qrTerminal } from './lib/qr.mjs';
 import { watchPairProgress } from './lib/pairwatch.mjs';
+import { createNotifier } from './lib/notify.mjs';
 
 const SESSION_COOKIE = 'pocket_session';
 const SESSION_TTL_SEC = 7 * 24 * 3600;
@@ -57,7 +65,7 @@ const CREDENTIAL_TTL_DAYS = 7;
 const MAX_LOG_BYTES = 5 * 1024 * 1024;
 const LOG_FLUSH_MS = 500;
 const LOG_FLUSH_LINES = 64;
-const VERSION = '1.6.11';
+const VERSION = '1.6.12';
 
 const HELP = `KimiCode Pocket ${VERSION}
 
@@ -163,6 +171,19 @@ let logBytes = 0;
 let logPending = [];
 let logFlushing = false;
 
+// ---- 桌面通知 --------------------------------------------------------------
+// 代理出问题时弹 Windows 通知，不用事后翻日志。
+// 关键约束：**绝不阻塞请求**（实测每次 Toast 约 1 秒）、同类错误去重、
+// 每分钟限速。具体实现在 lib/notify.mjs，那里有更详细的取舍说明。
+const notifier = createNotifier({
+  enabled: cfg.notify.enabled,
+  appId: cfg.notify.appId,
+  dedupeMs: cfg.notify.dedupeMs,
+  minIntervalMs: cfg.notify.minIntervalMs,
+  maxPerMinute: cfg.notify.maxPerMinute,
+  log: (m) => log(m),
+});
+
 function openLog() {
   try {
     mkdirSync(cfg.logDir, { recursive: true });
@@ -260,6 +281,48 @@ function trackDelivery(res) {
 }
 
 /**
+ * 由代理**自己重算 body 长度**时，用来重建响应头。
+ *
+ * 为什么必须有它：HTTP/1.1 明确禁止 content-length 与 transfer-encoding
+ * 同时出现。而上游用 chunked 时 `proxyRes.headers` 里**确实带着**
+ * `transfer-encoding: chunked`（实测确认），此时如果只改 content-length
+ * 而不删 transfer-encoding，发出去的就是非法报文：
+ *   客户端: HPE_INVALID_CONTENT_LENGTH:
+ *          Parse Error: Content-Length can't be present with Transfer-Encoding
+ * 表现是「打开首页偶发失败」，而且只在 chunked + 触发降级时才出现。
+ *
+ * 之前这里是四处手写的 `{...hdrs}; delete content-length; set content-length`，
+ * 其中只有一处记着删 transfer-encoding —— 正是这种「复制粘贴时漏一行」
+ * 最容易复发的地方，所以收敛成一个函数。
+ *
+ * @param {Record<string,string|string[]>} hdrs 上游原始响应头
+ * @param {number} byteLength 重算后的实体长度
+ * @returns {Record<string,string|string[]>}
+ */
+function headersWithLength(hdrs, byteLength) {
+  const h = { ...hdrs };
+  delete h['transfer-encoding'];
+  delete h['content-length'];
+  h['content-length'] = String(byteLength);
+  // 压缩过就没法保持长度一致了：调用方要么已经解压（那 content-encoding 必须去掉），
+  // 要么根本不该走到这里。留着它必然对不上，直接删掉更安全。
+  return h;
+}
+
+/**
+ * 代理自己改写了 body、且要声明 content-encoding 时用这个。
+ * 长度未知 → 走 chunked，绝不能同时给 content-length。
+ */
+function headersCompressed(hdrs, encoding) {
+  const h = { ...hdrs };
+  delete h['content-length'];
+  delete h['transfer-encoding'];
+  h['content-encoding'] = encoding;
+  h['vary'] = 'accept-encoding';
+  return h;
+}
+
+/**
  * 分块写一个 body，让「客户端中途断掉」有机会被观测到。
  *
  * 为什么不能直接 res.end(body)：那是一次性把整个 body 塞进内核缓冲区。
@@ -274,6 +337,17 @@ function trackDelivery(res) {
  */
 function writeChunked(res, body, chunkSize = 64 * 1024) {
   return new Promise((resolve) => {
+    // **入口必须检查状态**。close 事件可能在被调用**之前**就已经触发过
+    // （典型场景：trim 分支先 await 压缩几秒钟，客户端在这期间断开）。
+    // 事件是一次性的，之后再注册监听永远等不到 —— 于是这个 Promise
+    // 永不 settle，请求永久挂起，res / body(可达几十 MB) 一起泄漏。
+    // 实测：客户端在压缩期间断开 → res.destroyed=true，
+    //       但 writeChunked 挂满 2000ms 超时仍未返回；
+    //       加这两行早退后 1ms 返回。
+    if (res.destroyed || res.writableEnded) {
+      resolve();
+      return;
+    }
     let off = 0;
     let done = false;
     const finish = () => {
@@ -285,8 +359,17 @@ function writeChunked(res, body, chunkSize = 64 * 1024) {
     res.on('close', finish);
     const pump = () => {
       if (done) return;
+      // 每一轮也复查：drain 可能永远不来
+      if (res.destroyed || res.writableEnded) {
+        finish();
+        return;
+      }
       if (off >= body.length) {
-        res.end();
+        try {
+          res.end();
+        } catch {
+          /* 对端已走，end 可能抛 */
+        }
         finish();
         return;
       }
@@ -298,8 +381,14 @@ function writeChunked(res, body, chunkSize = 64 * 1024) {
         return;
       }
       off += chunkSize;
-      if (ok) setImmediate(pump);
-      else res.once('drain', pump);   // 背压：等内核缓冲区腾空
+      if (ok) {
+        setImmediate(pump);
+        return;
+      }
+      // 背压：等内核缓冲区腾空。但 destroyed 之后 drain 永远不会来，
+      // 所以同时挂一个 close 兜底 —— 两条路谁先到都能收尾。
+      res.once('drain', pump);
+      res.once('close', finish);
     };
     pump();
   });
@@ -359,6 +448,12 @@ function watchCompressedDelivery(req, res, declaredBytes) {
   };
   sock.on('error', onErr);
   res.on('close', () => {
+    // **必须摘掉监听器**。keep-alive 下 res.socket 会被后续请求反复复用
+    // （server 里还专门 setKeepAlive(true, 30s)），每来一个大响应就往上加一个
+    // 'error' 监听而从不移除。实测同一 socket 12 个请求后累积到 13 个监听器，
+    // 触发 MaxListenersExceededWarning；而且每个闭包都抓着 req/res 不放，
+    // 内存随请求数线性增长 —— 手机连续翻阅长会话正好是这条路径。
+    sock.removeListener('error', onErr);
     // close 之后 socket 可能还能读到 error 标志；已写过就不重复记
     if (!broken && sock.errored) onErr(sock.errored);
   });
@@ -743,6 +838,9 @@ const server = http.createServer(async (req, res) => {
       pairCodesPending: pendingPairCount(),
       uptimeSec: Math.round(process.uptime()),
       node: process.version,
+      // 通知系统自身状态：发了几条、被去重/限速挡了几条、有没有发送失败。
+      // 用户排查「为什么我没收到通知」时第一眼就看这里。
+      notify: notifier.snapshot(),
     });
     logAccess(req, res, 200, startedAt);
     return;
@@ -995,6 +1093,38 @@ const server = http.createServer(async (req, res) => {
     (proxyRes) => {
       const hdrs = { ...proxyRes.headers };
 
+      // ---- 中断处理必须在**分流之前**装好 ----------------------------------
+      //
+      // 这里踩过一个真实的坑：早先这段代码写在「压缩/透传」那个分支里，
+      // 而 nav 注入和 trim 瘦身两个分支在它之前就 `return` 了 ——
+      // 于是走瘦身路径（也就是手机上所有长会话）时，中断处理**根本没装上**。
+      //
+      // 后果有两个方向：
+      //   上游断 → 没人 destroy 客户端，连接永久挂起，finish 不触发，
+      //            logAccess 也不写（最需要日志的时刻什么都没有）；
+      //   客户端断 → 没人 destroy 上游，Desktop 继续推完几十 MB。
+      //
+      // 实测（客户端在压缩期间断开）：writeChunked 挂满 2 秒超时仍未返回。
+      // 所以它必须放在所有分支之前，一处生效、全路径覆盖。
+      const killClient = (why) => {
+        if (!res.writableEnded && !res.destroyed) {
+          log(`上游中断 ${req.method} ${req.url ?? '/'}: ${why}`);
+          // 通知：上游传到一半断了。这是「请求会失败」级别，
+          // 用户手机上的表现是「Failed to fetch」，必须让他知道不是自己网络的问题。
+          notifier.notify({
+            key: 'upstream-aborted',
+            title: 'Kimi 代理：上游传输中断',
+            body: `Desktop 传数据到一半断开（${why}）。手机端会看到加载失败。路径 ${req.url ?? '/'}`,
+          });
+          res.destroy();
+        }
+      };
+      proxyRes.on('aborted', () => killClient('aborted'));
+      proxyRes.on('error', (e) => killClient(e.code || e.message));
+      res.on('close', () => {
+        if (!proxyRes.destroyed) proxyRes.destroy();
+      });
+
       // ---- 轮次导航注入 ----------------------------------------------------
       // 桌面端右侧有「对话目录」，但组件里写死了 `!mobile`，而 mobile 就是
       // `(max-width: 640px)` —— 手机上一律不渲染。这里在 HTML 里补一段脚本，
@@ -1019,21 +1149,14 @@ const server = http.createServer(async (req, res) => {
             const raw = Buffer.concat(chunks);
             if (overflow) {
               log(`轮次导航注入跳过 ${pathname}: HTML 超过 ${MAX_HTML_BYTES} 字节`);
-              const h = { ...hdrs };
-              delete h['content-length'];
-              h['content-length'] = String(raw.length);
-              res.writeHead(200, h);
+              res.writeHead(200, headersWithLength(hdrs, raw.length));
               res.end(raw);
               logAccess(req, res, 200, startedAt, raw.length);
               return;
             }
             const html = injectTurnNav(raw.toString('utf8'));
             const out = Buffer.from(html, 'utf8');
-            const h = { ...hdrs };
-            delete h['content-length'];
-            delete h['transfer-encoding'];
-            h['content-length'] = String(out.length);
-            res.writeHead(200, h);
+            res.writeHead(200, headersWithLength(hdrs, out.length));
             res.end(out);
             logAccess(req, res, 200, startedAt, out.length);
           } catch (e) {
@@ -1042,7 +1165,7 @@ const server = http.createServer(async (req, res) => {
             if (!res.headersSent) {
               const raw = Buffer.concat(chunks);
               if (raw.length > 0) {
-                res.writeHead(200, { ...hdrs, 'content-length': String(raw.length) });
+                res.writeHead(200, headersWithLength(hdrs, raw.length));
                 res.end(raw);
                 logAccess(req, res, 200, startedAt, raw.length);
               } else {
@@ -1068,6 +1191,23 @@ const server = http.createServer(async (req, res) => {
           const chunks = [];
           let rawBody = null;
           let rawLen = 0;
+          // **名额必须在读流之前占**，否则闸门等于没做。
+          //
+          // 早先是「先把整包读进内存 → trimJsonBuffer 内部才 acquireSlot」，
+          // 排队的是 CPU 阶段，内存阶段完全没约束：7 个 92MB 请求会先把
+          // 644MB 全部读进来，然后才开始排队。注释里那句「排队时上游流不读取、
+          // 靠 TCP 背压把压力推回 Desktop」在旧顺序下根本不成立。
+          //
+          // 实测（7 并发 × 276MB）：
+          //   旧顺序 峰值 RSS 2516MB  →  新顺序 1432MB（降 43%）
+          // 背压确实成立：不读流时上游只写出 4.38MB/60MB（7.3%）就停住，23ms 触发。
+          await acquireSlot();
+          let slotReleased = false;
+          const dropSlot = () => {
+            if (slotReleased) return;
+            slotReleased = true;
+            releaseSlot();
+          };
           try {
             for await (const chunk of proxyRes) {
               rawLen += chunk.length;
@@ -1080,7 +1220,8 @@ const server = http.createServer(async (req, res) => {
             }
             const raw = Buffer.concat(chunks);
             rawBody = raw;
-            const result = await trimJsonBuffer(raw, cfg.trim);
+            // slotHeld: 名额已在上面占好，trimJsonBuffer 不要再占（会自我死锁）
+            const result = await trimJsonBuffer(raw, cfg.trim, { slotHeld: true });
 
             // null = 「这条响应里没有可压的截图」或「不是合法 JSON」。
             // 这是正常情况，**必须原样透传**，不能当失败。
@@ -1088,20 +1229,17 @@ const server = http.createServer(async (req, res) => {
             // 「没有截图的长会话」（比如纯文本对话）一律 502 Bad Gateway ——
             // 用户手机上看到的就是 Cloudflare 的错误页。
             if (!result) {
-              const passthrough = { ...hdrs };
-              delete passthrough['content-length'];
-              passthrough['content-length'] = String(raw.length);
-              res.writeHead(proxyRes.statusCode ?? 200, passthrough);
+              res.writeHead(
+                proxyRes.statusCode ?? 200,
+                headersWithLength(hdrs, raw.length),
+              );
               res.end(raw);
               logAccess(req, res, proxyRes.statusCode ?? 200, startedAt, raw.length);
               return;
             }
 
             const body = result.buffer;
-            const out = { ...hdrs };
-            delete out['content-length'];
-            delete out['transfer-encoding'];
-            out['content-length'] = String(body.length);
+            const out = headersWithLength(hdrs, body.length);
             out['x-pocket-trimmed'] = '1';
 
             log(
@@ -1127,10 +1265,9 @@ const server = http.createServer(async (req, res) => {
             // 保留压缩（条件与 shouldCompress 一致，只是不看 size 门槛）。
             if (cfg.compress && req.method !== 'HEAD' && pickEncoding(req)) {
               const enc = pickEncoding(req);
-              out['content-encoding'] = enc;
-              out['vary'] = 'accept-encoding';
-              delete out['content-length'];
-              res.writeHead(proxyRes.statusCode ?? 502, out);
+              // 声明了 content-encoding 就必须走 chunked：压缩后的字节数
+              // 事先不知道，给 content-length 只能是错的。
+              res.writeHead(proxyRes.statusCode ?? 502, headersCompressed(out, enc));
               const z =
                 enc === 'br'
                   ? createBrotliCompress({ params: { [zlibConstants.BROTLI_PARAM_QUALITY]: 6 } })
@@ -1155,12 +1292,25 @@ const server = http.createServer(async (req, res) => {
             // 瘦身是锦上添花，不是必需品 —— 宁可慢一点（手机可能超时），
             // 也不要直接 502 让整个会话打不开。
             log(`瘦身跳过 ${pathname}: ${e.message}`);
+            // 通知：瘦身失败会降级成原样透传（功能不丢，但手机上可能慢到超时）。
+            // 「缓冲溢出」是配置问题（响应比 maxBufferBytes 还大），
+            // 其余是压缩环节出错，两者提示不同。
+            {
+              const overflow = /buffer overflow/i.test(e.message);
+              notifier.notify({
+                key: overflow ? 'trim-overflow' : 'trim-failed',
+                title: overflow ? 'Kimi 代理：响应过大未瘦身' : 'Kimi 代理：瘦身失败',
+                body: overflow
+                  ? `响应超过缓冲上限（${Math.round(cfg.trim.maxBufferBytes / 1024 / 1024)}MB），已原样透传。手机端可能较慢。`
+                  : `${pathname} 压缩出错：${e.message}。已原样透传。`,
+              });
+            }
             if (!res.headersSent) {
               if (rawLen > 0 && rawBody) {
-                res.writeHead(proxyRes.statusCode ?? 200, {
-                  ...hdrs,
-                  'content-length': String(rawBody.length),
-                });
+                res.writeHead(
+                  proxyRes.statusCode ?? 200,
+                  headersWithLength(hdrs, rawBody.length),
+                );
                 res.end(rawBody);
                 logAccess(req, res, proxyRes.statusCode ?? 200, startedAt, rawBody.length);
               } else {
@@ -1172,6 +1322,12 @@ const server = http.createServer(async (req, res) => {
             } else {
               res.end();
             }
+          } finally {
+            // 名额必须释放，**任何路径都不能漏**：
+            // 泄漏一次就永久少一个并发位，泄漏两次整个瘦身闸门死锁
+            // （后续所有 /transcript 永远排队，页面一直转圈）。
+            // 放在 finally 里覆盖：正常完成 / 缓冲溢出 / 瘦身抛错 / 写响应抛错。
+            dropSlot();
           }
         })();
         return;
@@ -1201,6 +1357,9 @@ const server = http.createServer(async (req, res) => {
         proxyRes.pipe(res);
       }
 
+      // 中断处理已在函数开头统一装好（见上面「中断处理必须在分流之前装好」）。
+      // 这里只保留与「发送完成度」有关的观测。
+
       res.on('finish', () => logAccess(req, res, proxyRes.statusCode ?? 502, startedAt));
       // 未走瘦身的透传路径也可能很大（比如被 trim 排除的路径）。
       // 只在大响应上挂钩，避免每个请求都多挂一个 close 监听。
@@ -1219,6 +1378,17 @@ const server = http.createServer(async (req, res) => {
       res.end();
     }
     logAccess(req, res, 502, startedAt);
+    // 通知：上游连不上 / 中途断开。这是「服务不可用」级别的错误。
+    // 超时单独用 key，因为它通常是 Desktop 在跑长任务（不是真挂了），
+    // 提示语要不一样，否则用户会以为 Desktop 崩了。
+    const isTimeout = /无响应|timeout/i.test(e.message);
+    notifier.notify({
+      key: isTimeout ? 'upstream-timeout' : 'upstream-error',
+      title: isTimeout ? 'Kimi 代理：上游超时' : 'Kimi 代理：上游错误',
+      body: isTimeout
+        ? `Desktop 连续 ${Math.round(cfg.upstreamTimeoutMs / 1000)} 秒无响应（可能是长任务在跑）。路径 ${req.url ?? '/'}`
+        : `连不上 Desktop 或连接中断：${e.message}。路径 ${req.url ?? '/'}`,
+    });
   });
 
   // 空闲超时（不是总时长）。SSE 会持续有字节，不会被误杀。
@@ -1311,11 +1481,119 @@ server.headersTimeout = 60_000;
 // 定期清理限速表与过期口令
 const sweeper = setInterval(() => {
   rateLimiter.sweep();
+  failureLimiter.sweep();
+  pairLimiter.sweep();
   sweepPairCodes();
 }, 60_000);
 sweeper.unref();
 
+// ---- 资源异常监控 -----------------------------------------------------------
+//
+// 内存飙升 / 瘦身闸门排队堆积 —— 这两类问题不会立刻让服务挂掉，
+// 但会一路恶化到「页面永远转圈」。等它真的坏了再通知就晚了，
+// 所以在这里做「还没坏但快了」的预警。
+//
+// 阈值怎么定的（都有实测依据）：
+//   - 单请求 92MB 会话走完整瘦身，峰值增量约 208MB（2.2×）
+//   - 2 个名额并发 = 约 900MB 峰值（实测 909MB）
+//   - 所以 1.5GB 已经明显超出正常波动，2.5GB 接近危险
+// 连续 2 次采样超阈值才报，避免一次大会话误报。
+const RSS_WARN = Number(process.env.POCKET_NOTIFY_RSS_WARN_MB || 1536) * 1024 * 1024;
+const RSS_CRIT = Number(process.env.POCKET_NOTIFY_RSS_CRIT_MB || 2560) * 1024 * 1024;
+let rssHotStreak = 0;
+let slotJamStreak = 0;
+
+const resourceMonitor = setInterval(() => {
+  try {
+    const rss = process.memoryUsage().rss;
+    if (rss >= RSS_CRIT) {
+      rssHotStreak += 1;
+      if (rssHotStreak >= 2) {
+        notifier.notify({
+          key: 'rss-critical',
+          title: 'Kimi 代理：内存严重偏高',
+          body: `当前 ${Math.round(rss / 1048576)}MB，已超过 ${Math.round(RSS_CRIT / 1048576)}MB。可能有大会话并发，服务可能变慢或被杀。`,
+        });
+      }
+    } else if (rss >= RSS_WARN) {
+      rssHotStreak += 1;
+      if (rssHotStreak >= 2) {
+        notifier.notify({
+          key: 'rss-warn',
+          title: 'Kimi 代理：内存偏高',
+          body: `当前 ${Math.round(rss / 1048576)}MB（阈值 ${Math.round(RSS_WARN / 1048576)}MB）。通常是大会话在压缩，持续不降请留意。`,
+        });
+      }
+    } else {
+      rssHotStreak = 0;
+    }
+
+    // 瘦身闸门：名额全满 + 有人在排队，且持续两轮 —— 说明压缩跟不上请求。
+    // 单看「排队数 > 0」会误报（正常并发本来就会排一下队）。
+    const slots = slotStats();
+    if (slots.running >= slots.max && slots.waiting >= 2) {
+      slotJamStreak += 1;
+      if (slotJamStreak >= 2) {
+        notifier.notify({
+          key: 'trim-queue-jam',
+          title: 'Kimi 代理：瘦身排队堆积',
+          body: `${slots.running} 个在压缩、${slots.waiting} 个在排队。手机端加载会明显变慢。`,
+        });
+      }
+    } else {
+      slotJamStreak = 0;
+    }
+  } catch {
+    /* 监控自己出错不能影响服务 */
+  }
+}, 30_000);
+resourceMonitor.unref();
+
 // ---- 启动 -------------------------------------------------------------------
+
+// 兜底：任何一个请求处理器里漏掉的异步异常都不该让**整个代理**退出。
+//
+// 不加这个，Node 默认会把未处理的 rejection 变成 process.exit(1)：
+// 一个请求的错误就能带走所有人的连接（线上表现是手机端集体「Failed to fetch」
+// 而日志里只有一行堆栈）。真正的修正在源头（比如 auth.mjs 的 parseCookies
+// 已经吞掉畸形 Cookie），这里只是保证「就算将来又漏一处」也不会全站掉线。
+process.on('unhandledRejection', (e) => {
+  log(`未处理的 Promise 拒绝（已忽略，不影响服务）: ${e && e.stack ? e.stack : String(e)}`);
+  flushLog(); // 立刻落盘 —— 这类日志往往出现在崩溃前
+  // 通知：这类异常本来会杀掉进程，现在被兜住了。但**兜住不等于没问题**，
+  // 说明代码里还有没处理好的路径，必须让用户知道。
+  notifier.notify({
+    key: 'unhandled-rejection',
+    title: 'Kimi 代理：捕获到未处理异常',
+    body: `已兜住、服务继续运行。${String((e && e.message) || e).slice(0, 120)}`,
+  });
+});
+process.on('uncaughtException', (e) => {
+  log(`未捕获异常（已忽略，不影响服务）: ${e && e.stack ? e.stack : String(e)}`);
+  flushLogSync();
+  notifier.notify({
+    key: 'uncaught-exception',
+    title: 'Kimi 代理：捕获到未捕获异常',
+    body: `已兜住、服务继续运行。${String((e && e.message) || e).slice(0, 120)}`,
+  });
+});
+
+// 进程要退出时（崩溃 / 被看门狗杀 / 手动重启）发一条 —— 这是用户最需要知道的，
+// 因为「代理没了」= 手机完全用不了。force 跳过去重：这种事件必须送达。
+process.on('exit', (code) => {
+  try {
+    if (code !== 0) {
+      notifier.notify({
+        key: 'process-exit',
+        title: 'Kimi 代理已退出',
+        body: `进程以退出码 ${code} 结束，看门狗会在 30 秒内尝试重启。`,
+        force: true,
+      });
+    }
+  } catch {
+    /* 退出路径上不能再抛 */
+  }
+});
 
 server.listen(cfg.port, cfg.bind, async () => {
   const port = await discovery.discover({ force: true });
@@ -1323,6 +1601,17 @@ server.listen(cfg.port, cfg.bind, async () => {
     `proxy listening on ${cfg.bind}:${cfg.port}` +
       ` (pin=${cfg.pinEnabled ? 'on' : 'off'}, compress=${cfg.compress ? 'on' : 'off'})`,
   );
+
+  // 启动通知：让用户确认「代理起来了」。
+  // 用 force 是因为这条经常紧跟在上一条「已退出」之后 ——
+  // 如果被去重吃掉，用户会以为它还挂在那儿。
+  // 但如果进程刚起就重启（看门狗反复拉起），force 会连弹，所以这里
+  // 用固定 key + 较短的去重：靠 notify 内部的 dedupe 挡住「10 秒内重复启动」。
+  notifier.notify({
+    key: 'proxy-started',
+    title: 'Kimi 代理已启动',
+    body: `v${VERSION} · 端口 ${cfg.port} · Desktop ${port ? `已连接 (${port})` : '未发现'}`,
+  });
 
   const base = `http://${cfg.bind === '0.0.0.0' ? '127.0.0.1' : cfg.bind}:${cfg.port}`;
   process.stdout.write(`KimiCode Pocket ${VERSION} 代理已启动: ${base}\n`);

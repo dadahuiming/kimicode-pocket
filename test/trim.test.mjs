@@ -538,3 +538,88 @@ test('trimJsonBuffer：数组里混着图片与文字，只换图片', async () 
   assert.equal(after.data.items.length, 6);
   assert.equal(res.stats.images, 3, '应该换了 3 张图');
 });
+
+// ---- 回归：闸门必须在读流之前占名额（v1.6.12）---------------------------
+
+test('闸门：acquireSlot 占满后必须排队，releaseSlot 后放行', async () => {
+  const { acquireSlot, releaseSlot, slotStats } = await import('../src/lib/trim.mjs');
+  // 清场：把可能残留的名额全部释放
+  while (slotStats().running > 0) releaseSlot();
+  assert.equal(slotStats().running, 0, '起始应为 0');
+
+  await acquireSlot();
+  await acquireSlot();
+  assert.equal(slotStats().running, 2, '应占满 2 个名额');
+
+  // 第三个必须排队（不能立刻 resolve）
+  let third = false;
+  const p = acquireSlot().then(() => { third = true; });
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(third, false, '名额满了之后必须排队，不能立刻放行');
+  assert.equal(slotStats().waiting, 1);
+
+  releaseSlot();
+  await p;
+  assert.equal(third, true, 'releaseSlot 后排队者应被放行');
+
+  // 收尾
+  while (slotStats().running > 0) releaseSlot();
+});
+
+test('闸门：slotHeld=true 时 trimJsonBuffer 不能再占名额（会自我死锁）', async () => {
+  const { trimJsonBuffer, acquireSlot, releaseSlot, slotStats } = await import('../src/lib/trim.mjs');
+  const { clearCaches } = await import('../src/lib/trim.mjs');
+  while (slotStats().running > 0) releaseSlot();
+  clearCaches();
+
+  // 造一个带 PNG 的最小 JSON
+  const png = makePng(200, 200);
+  const body = Buffer.from(JSON.stringify({
+    data: { items: [{ stepId: 's0', frames: [{ kind: 'tool', output: [{ type: 'image_url', imageUrl: { url: `data:image/png;base64,${png.toString('base64')}` } }] }] }] },
+  }), 'utf8');
+
+  // 模拟 proxy：先占名额，再调 trimJsonBuffer(slotHeld: true)
+  await acquireSlot();
+  assert.equal(slotStats().running, 1);
+
+  const t0 = Date.now();
+  const r = await Promise.race([
+    trimJsonBuffer(body, trimCfg, { slotHeld: true }).then(() => 'done'),
+    new Promise((res) => setTimeout(() => res('DEADLOCK'), 5000)),
+  ]);
+  const ms = Date.now() - t0;
+
+  assert.notEqual(r, 'DEADLOCK', 'slotHeld=true 却自己又去占名额 —— 自我死锁');
+  assert.ok(ms < 4000, `不该卡这么久（${ms}ms）`);
+
+  // 名额仍应被调用方持有（trimJsonBuffer 不替它释放）
+  assert.equal(slotStats().running, 1, 'slotHeld 时名额归调用方，trimJsonBuffer 不能替它释放');
+  releaseSlot();
+  assert.equal(slotStats().running, 0);
+});
+
+test('闸门：trimJsonBuffer 抛异常时不能泄漏名额', async () => {
+  const { trimJsonBuffer, acquireSlot, releaseSlot, slotStats, clearCaches } = await import('../src/lib/trim.mjs');
+  while (slotStats().running > 0) releaseSlot();
+  clearCaches();
+
+  const before = slotStats().running;
+  // 非 JSON 会让它返回 null（正常），这里用一个会让内部抛错的输入：
+  // 超大 Buffer 不是好办法，直接用 null 触发 TypeError
+  try {
+    await trimJsonBuffer(null, trimCfg);
+  } catch {
+    /* 预期会抛 */
+  }
+  // 自己占名额再传 slotHeld，模拟 proxy 路径下的异常
+  await acquireSlot();
+  try {
+    await trimJsonBuffer(Buffer.from('not json'), trimCfg, { slotHeld: true });
+  } catch {
+    /* 允许抛 */
+  }
+  // 名额必须仍由调用方持有，且总量不变（没被内部多占/多放）
+  assert.equal(slotStats().running, before + 1, '名额数被内部改动了 —— 会泄漏或变负');
+  releaseSlot();
+  assert.equal(slotStats().running, before);
+});

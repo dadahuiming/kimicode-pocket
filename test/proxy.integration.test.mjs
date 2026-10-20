@@ -81,9 +81,11 @@ function makeTestPng(width, height) {
 }
 
 /** 假 Desktop：覆盖探活、回显头、大 JSON、WebSocket */
-function startFakeDesktop() {
+function startFakeDesktop({ handler } = {}) {
   return new Promise((resolve) => {
     const server = http.createServer((req, res) => {
+      // 允许测试注入自定义处理器（构造 chunked / 半途断流等特殊上游）
+      if (handler) return handler(req, res);
       if (req.url === '/api/v1/healthz') {
         res.writeHead(200, { 'content-type': 'text/plain' });
         res.end('ok');
@@ -645,4 +647,59 @@ test('轮次导航：注入脚本语法合法（正则转义写错会整页白�
   assert.doesNotThrow(() => new Function(code), '注入的脚本必须能被解析');
   // 结束标签必须被转义掉，否则 HTML 提前闭合、后面的 DOM 全变文本
   assert.ok(!/<\/script/i.test(code), '脚本体内不能出现未转义的 </script');
+});
+
+// ---- 回归：v1.6.12 修掉的代理层缺陷 ----------------------------------------
+
+test('回归：上游 chunked 时不能同时下发 content-length（HTTP/1.1 禁止）', async () => {
+  // HTTP/1.1 明确禁止 Content-Length 与 Transfer-Encoding 并存。
+  // 上游用 chunked 时 proxyRes.headers 里确实带着 transfer-encoding，
+  // 如果代理由自己重算 body 长度却只改 content-length（漏删 transfer-encoding），
+  // 发出去的就是非法报文。实测客户端直接报：
+  //   HPE_INVALID_CONTENT_LENGTH:
+  //   Parse Error: Content-Length can't be present with Transfer-Encoding
+  //
+  // 这里用一个 chunked 的 HTML 上游，走「注入后重算长度」的主路径，
+  // 断言客户端能正常解析 —— 能解析就说明两个头没有并存。
+  const chunked = await startFakeDesktop({
+    handler: (req, res) => {
+      // 刻意不给 content-length => Node 自动用 chunked
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end('<!doctype html><html><head><title>Kimi Code</title></head><body><div id="app"></div></body></html>');
+    },
+  });
+  const p = await startProxy({ desktopPort: chunked.port });
+  try {
+    const r = await fetch(`${p.base}/`);
+    assert.equal(r.status, 200);
+    // fetch 能走到这里就说明报文合法（Node 的解析器会拒绝 CL+TE 并存）
+    const html = await r.text();
+    assert.match(html, /<title>Kimi Code<\/title>/);
+    // 注入应该生效（长度被重算了）
+    assert.ok(html.includes('pocket-turn-nav'), 'chunked 上游也应该能注入');
+  } finally {
+    p.stop();
+    await new Promise((r) => chunked.server.close(r));
+  }
+});
+
+test('回归：畸形 Cookie 不会打挂代理进程（远程 DoS）', async () => {
+  // decodeURIComponent 遇到非法百分号编码会抛 URIError；
+  // 这个调用在 async 请求处理器里，异常变成未处理的 rejection，
+  // Node 默认 process.exit(1) —— 一个请求带走整个代理。
+  const pinProxy = await startProxy({ desktopPort: fake.port, pin: 'longenoughpin' });
+  try {
+    const r = await fetch(`${pinProxy.base}/`, {
+      headers: { cookie: 'pocket_session=%E0%A4%A' },
+      redirect: 'manual',
+    });
+    // 关键不是状态码，而是「进程还活着」
+    assert.ok(r.status >= 200 && r.status < 500, `不该是 ${r.status}`);
+
+    // 再打一次健康检查，确认进程仍在服务
+    const h = await fetch(`${pinProxy.base}/__healthz`);
+    assert.equal(h.status, 200, '进程被打挂了 —— 畸形 Cookie 回归了');
+  } finally {
+    pinProxy.stop();
+  }
 });

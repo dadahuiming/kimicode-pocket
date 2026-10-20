@@ -68,20 +68,38 @@ const respBytes = { bytes: 0 };
 
 // ---------------------------------------------------------------- 并发闸门
 //
-// 真实事故：前端会在会话打开时**并发**打多个 /transcript（实测一次 13 个）。
-// 每个都是 51MB、31 张图。如果任由它们同时进来：
+// 真实事故：前端会在会话打开时**并发**打多个 /transcript（实测一次 13 个，
+// 生产日志里同一秒最多 7 个，单个 92MB）。如果任由它们同时进来：
 //   - 4 个 worker 被抢爆，每个请求排队等 CPU
-//   - 主线程同时持有 13 × 51MB = 663MB 的 Buffer
+//   - 主线程同时持有 7 × 92MB ≈ 644MB 的 Buffer
 //   - 结果全都超时，页面永远「加载中」
 //
 // 所以必须限流：同一时刻只处理 N 个瘦身任务，其余排队。
-// 排队时上游流**不读取**，靠 TCP 背压把压力推回 Desktop —— 内存不会爆。
+//
+// ⚠️ 这个闸门**必须在读流之前**占名额，否则等于没做。
+//
+// 早先的实现是「proxy 先把整包读进内存 → 再调 trimJsonBuffer → 里面才 acquireSlot」。
+// 那时排队的是**CPU 阶段**，内存阶段完全没有约束：7 个 92MB 请求会先把
+// 644MB 全部读进来，然后才开始排队。注释里「排队时上游流不读取，靠 TCP 背压
+// 把压力推回 Desktop」这句话，在旧顺序下**根本不成立**。
+//
+// 实测（7 并发 × 276MB，走真实 trimJsonBuffer）：
+//   旧顺序（先缓冲后占名额）：峰值 RSS 2516MB
+//   新顺序（先占名额后读流）：峰值 RSS 1432MB   ← 降 43%
+// 背压也确实成立：不读流时上游只写出 4.38MB/60MB（7.3%）就停住，23ms 内触发。
+//
+// 现在由 proxy 在 `for await (const chunk of proxyRes)` **之前**调用
+// acquireSlot()，读完（或失败）后 releaseSlot()。
 const MAX_CONCURRENT_TRIM = 2;
 let running = 0;
 const waiting = [];
 const inflightResponses = new Map(); // respKey -> Promise<{buffer,stats}|null>
 
-function acquireSlot() {
+/**
+ * 占用一个瘦身名额。**在读上游流之前调用。**
+ * @returns {Promise<void>}
+ */
+export function acquireSlot() {
   if (running < MAX_CONCURRENT_TRIM) {
     running += 1;
     return Promise.resolve();
@@ -89,13 +107,19 @@ function acquireSlot() {
   return new Promise((resolve) => waiting.push(resolve));
 }
 
-function releaseSlot() {
+/** 释放名额。必须在 finally 里调用，否则名额泄漏会让后续请求永久排队。 */
+export function releaseSlot() {
   const next = waiting.shift();
   if (next) {
     next(); // 名额直接转交，running 不变
   } else {
     running -= 1;
   }
+}
+
+/** 诊断：当前占用/排队情况（测试与 /__status 用） */
+export function slotStats() {
+  return { running, waiting: waiting.length, max: MAX_CONCURRENT_TRIM };
 }
 
 /** 清空缓存（测试用） */
@@ -231,11 +255,19 @@ function applyImages(value, results, stats, depth = 0) {
  *
  * 只压缩 base64 PNG 截图；文字内容与 JSON 结构完全不变。
  *
+ * @param {Buffer} buf
+ * @param {object} cfg
+ * @param {{ slotHeld?: boolean }} [opts]
+ *        slotHeld=true 表示调用方**已经**用 acquireSlot() 占了名额
+ *        （proxy 现在就是在读流前占的，见文件顶部闸门注释）。
+ *        此时本函数不再自己占，也不再自己释放 —— 由调用方负责。
+ *        不传则维持旧行为（自己占、自己放），保证既有测试与其它调用点不受影响。
  * @returns {Promise<{ buffer: Buffer, stats: object } | null>}
  *          null 表示「不改动，原样放过」
  */
-export async function trimJsonBuffer(buf, cfg) {
+export async function trimJsonBuffer(buf, cfg, opts = {}) {
   const originalBytes = buf.length;
+  const slotHeld = opts.slotHeld === true;
 
   // ---- 整响应缓存 ----
   // 手机每次进会话都会重新 fetch 同一个 /messages。内容没变时直接复用上次结果，
@@ -271,7 +303,9 @@ export async function trimJsonBuffer(buf, cfg) {
   }
 
   const task = (async () => {
-    await acquireSlot();
+    // slotHeld=true 时名额已经由调用方在读流前占好了，这里不能再占
+    // （再占一次会自我死锁：自己等自己刚占的那个名额）。
+    if (!slotHeld) await acquireSlot();
     try {
       // 阶段二：并行压缩（worker 线程，主线程不被阻塞）
       const results = new Map();
@@ -306,7 +340,10 @@ export async function trimJsonBuffer(buf, cfg) {
 
       return { buffer: out, stats };
     } finally {
-      releaseSlot();
+      // slotHeld 时名额归调用方所有，这里不能替它释放 ——
+      // 否则调用方的 finally 会再 release 一次，running 变负数，
+      // 闸门从此形同虚设（而且不会有任何报错）。
+      if (!slotHeld) releaseSlot();
     }
   })();
 

@@ -45,7 +45,17 @@ export function verifySessionToken(pin, token) {
   return constantTimeEqual(token, `${nonce}.${sessionMac(pin, nonce)}`);
 }
 
-/** 解析 Cookie 头 */
+/**
+ * 解析 Cookie 头。
+ *
+ * 单个 Cookie 编码非法时**跳过它**，绝不能让异常冒出去。
+ * 这条路径在 PIN 开启时对每个请求（含 WS upgrade）都会走，
+ * 而 `decodeURIComponent('...%E0%A4%A')` 会抛 URIError；
+ * http server 的 handler 是 async 函数，抛出的异常变成未处理的
+ * Promise rejection，Node 默认直接 `process.exit(1)` ——
+ * 也就是**任何人发一个畸形 Cookie 就能打挂整个代理**（远程 DoS）。
+ * 实测：`Cookie: pocket_session=%E0%A4%A` 即可复现进程退出。
+ */
 export function parseCookies(header) {
   const out = {};
   if (!header) return out;
@@ -54,7 +64,15 @@ export function parseCookies(header) {
     if (i < 0) continue;
     const k = part.slice(0, i).trim();
     if (!k) continue;
-    out[k] = decodeURIComponent(part.slice(i + 1).trim());
+    let v;
+    try {
+      v = decodeURIComponent(part.slice(i + 1).trim());
+    } catch {
+      // 坏 Cookie 当作不存在。故意不写 out[k]，
+      // 这样下游读到 undefined，与「没带这个 Cookie」完全一致。
+      continue;
+    }
+    out[k] = v;
   }
   return out;
 }
@@ -101,6 +119,21 @@ export class FailureLimiter {
 
   clear(key) {
     this.map.delete(key);
+  }
+
+  /**
+   * 周期性清理过期记录。
+   *
+   * 以前只有 `retryAfterMs` / `isLocked` 在**被查询时**顺手删自己那一条，
+   * 于是「只失败一次就再也没回来」的 key 会永久留在 map 里。
+   * 配合可伪造的客户端 IP（见 rewrite.mjs 的 clientIp），
+   * 每次换一个 IP 就能塞一条永久记录 —— map 无界增长。
+   */
+  sweep() {
+    const t = this.now();
+    for (const [k, v] of this.map) {
+      if (v.until <= t) this.map.delete(k);
+    }
   }
 }
 

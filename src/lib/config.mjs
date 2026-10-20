@@ -106,6 +106,29 @@ export function loadConfig(env = process.env) {
     logDir: env.POCKET_LOG_DIR || join(defaultStateDir(), 'logs'),
     publicUrl: normalizePublicUrl(env.POCKET_PUBLIC_URL),
 
+    // ---- 桌面通知（Windows Toast）-----------------------------------------
+    // 代理出问题时弹窗告诉用户，不然只能事后翻日志。
+    // 默认开启；非 Windows 或 WinRT 不可用时发送失败会被吞掉，不影响转发。
+    notify: {
+      enabled: toBool('POCKET_NOTIFY', env.POCKET_NOTIFY, true),
+      // 同类错误去重窗口：一串相同错误只弹一次
+      dedupeMs: toInt('POCKET_NOTIFY_DEDUPE_SEC', env.POCKET_NOTIFY_DEDUPE_SEC, 300, {
+        min: 10,
+        max: 86_400,
+      }) * 1000,
+      // 任意两条通知的最小间隔（防瞬间连弹）
+      minIntervalMs: toInt('POCKET_NOTIFY_MIN_INTERVAL_MS', env.POCKET_NOTIFY_MIN_INTERVAL_MS, 3000, {
+        min: 0,
+        max: 60_000,
+      }),
+      // 每分钟上限
+      maxPerMinute: toInt('POCKET_NOTIFY_MAX_PER_MIN', env.POCKET_NOTIFY_MAX_PER_MIN, 6, {
+        min: 1,
+        max: 60,
+      }),
+      appId: env.POCKET_NOTIFY_APPID || 'KimiCodePocket',
+    },
+
     // 上游空闲超时。Desktop 的流式输出会在 WS 上，但普通长任务
     // （会话压缩、大文件读写）可能长时间无字节，30s 会误杀。
     upstreamTimeoutMs: toInt('POCKET_UPSTREAM_TIMEOUT_MS', env.POCKET_UPSTREAM_TIMEOUT_MS, 120000, {

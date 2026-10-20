@@ -134,6 +134,178 @@ function buildScriptTag() {
   return `<script id="${TOC_SCRIPT_ID}">${code}</script>`;
 }
 
+// ---------------------------------------------------------------- 会话标识
+//
+// 缓存 key 必须能**唯一标识一个会话**，否则两个会话共用一份记录，
+// 表现就是「B 会话里出现 A 会话的历史节点」。
+//
+// 早先这里直接用 location.pathname。对**已存在的会话**这是准确的
+// （路径就是 /sessions/session_<uuid>），但对「新建会话」不行 ——
+// Desktop 自己的路径构造是：
+//     id 为空  → "/"
+//     id 有值  → "/sessions/" + encodeURIComponent(id)
+// （核对过 bundle 里的 $he() / EU() 两个函数）
+// 所以新建会话在**拿到 id 之前**路径都是 "/"，多个新会话共用同一份缓存。
+//
+// 修法：路径能取到 id 就用 id（s:<id>）；取不到就用
+// 「路径 + 最小真实 turn id 指纹」（p:<path>#t0）区分。
+// 新会话拿到 id 后由 migrateKey 把过渡记录搬过去。
+//
+// 这几个函数在这里定义（而不是塞进 CLIENT_JS 字符串里），是为了能被
+// **直接单测** —— 注入脚本是一整个 IIFE，在 Node 里跑它需要伪造整套 DOM，
+// 太脆。下面 CLIENT_JS 里会原样复用这同一份实现。
+
+const SESSION_PATH_RE = '/sessions/';
+
+/** 从 pathname 里取出会话 id；取不到返回 '' */
+export function sessionIdFromPath(p) {
+  if (!p || p.indexOf(SESSION_PATH_RE) !== 0) return '';
+  const rest = p.slice(SESSION_PATH_RE.length);
+  // 带子路径（/sessions/<id>/children 之类）不算会话页
+  if (!rest || rest.indexOf('/') >= 0) return '';
+  try {
+    return decodeURIComponent(rest) || '';
+  } catch {
+    return '';
+  }
+}
+
+/** 真实轮次 id 判定（乐观消息 msg_opt_* 不算） */
+export function isRealTurnIdForSession(id) {
+  return /^t\d+(?:[:.]|$)/.test(String(id || ''));
+}
+
+/**
+ * 会话指纹：给定一组 turn id，取**最小**的真实轮次号。
+ * 拿不到返回 ''。
+ *
+ * 用「最小」而不是「最新」：用户往下滚会加载更多历史，最新那条一直在变，
+ * 最小那条（t0）在会话内稳定。
+ */
+export function sessionFingerprintFrom(turnIds) {
+  let best = '';
+  let bestN = Infinity;
+  for (const id of turnIds || []) {
+    if (!isRealTurnIdForSession(id)) continue;
+    const m = /^t(\d+)/.exec(String(id));
+    if (!m) continue;
+    const n = parseInt(m[1], 10);
+    if (n < bestN) {
+      bestN = n;
+      best = `t${n}`;
+    }
+  }
+  return best;
+}
+
+/**
+ * 当前会话的缓存 key。
+ *
+ * 形态：
+ *   /sessions/<uuid>  →  "s:<uuid>"            （精确，最常用）
+ *   其它路径          →  "p:<pathname>#<fp>"   （过渡态，靠指纹区分）
+ *
+ * 前缀 s:/p: 让两种形态永不相撞 —— 万一某个会话 id 恰好叫 "p:/"，
+ * 加前缀也不会串。
+ *
+ * @param {string} pathname
+ * @param {string[]} turnIds 当前 DOM 里的 data-turn-id 列表
+ */
+export function sessionKeyFor(pathname, turnIds) {
+  const p = pathname || '/';
+  const sid = sessionIdFromPath(p);
+  if (sid) return `s:${sid}`;
+  const fp = sessionFingerprintFrom(turnIds);
+  return `p:${p}${fp ? `#${fp}` : ''}`;
+}
+
+/**
+ * 过渡 key → 精确 key 的迁移。
+ *
+ * 新会话时序：路径 "/"（此时已在记录）→ 应用 replaceState 到
+ * /sessions/<uuid>。不迁移的话，刚记下的节点留在 p:/#t0 里，
+ * 而新 key 是空的 —— 用户会看到「刚发的消息不在目录里」。
+ *
+ * 允许的迁移方向（其余一律拒绝）：
+ *   p:<path>        → s:<id>       新会话拿到 id，过渡态收尾
+ *   p:<path>        → p:<path>#t0  同一新会话内指纹出现（发第一条消息时）
+ *   s:/p: 之间其它组合、精确态内部迁移 —— 全部拒绝，避免串会话。
+ *
+ * 为什么需要第二条：新会话刚打开时 DOM 里还没有消息，key 是 p:/；
+ * 用户发出第一条消息后指纹变成 t0，key 变成 p:/#t0。
+ * 不做这条迁移的话，用户会在「刚发出第一条消息」的瞬间丢掉刚记下的东西。
+ *
+ * @param {(k:string)=>string|null} getItem
+ * @param {(k:string,v:string)=>void} setItem
+ * @param {(k:string)=>void} removeItem
+ */
+export function migrateKeyWith(fromKey, toKey, { getItem, setItem, removeItem }) {
+  if (!fromKey || !toKey || fromKey === toKey) return false;
+  const fromIsTransient = fromKey.indexOf('p:') === 0;
+  const toIsPrecise = toKey.indexOf('s:') === 0;
+  const toIsTransient = toKey.indexOf('p:') === 0;
+  if (!fromIsTransient) return false;
+  // 过渡态 → 精确态，或 过渡态 → 过渡态（指纹细化，同一路径）
+  const transientRefine =
+    toIsTransient && fromKey === toKey.split('#')[0];
+  if (!toIsPrecise && !transientRefine) return false;
+  try {
+    // 目标已有记录就不动它（那才是它自己的）
+    if (getItem(toKey)) return false;
+    const raw = getItem(fromKey);
+    if (!raw) return false;
+    setItem(toKey, raw);
+    removeItem(fromKey);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// 上面三个函数会被**原样注入**到浏览器脚本里（见 CLIENT_JS 里的 ${CLIENT_HELPERS}）。
+// 为什么要注入源码而不是重写一遍：重写就会出现两份实现，
+// 改了一边忘另一边 —— 这正是本项目已经踩过的坑（headersWithLength 那四处复制粘贴）。
+//
+// 注入时做两件事：
+//   - 去掉 export 关键字与类型注解（源码本身就是 ES5 兼容的写法）
+//   - 保持函数名一致，客户端直接调用
+function clientSourceOf(fn) {
+  return fn
+    .toString()
+    .replace(/^export\s+/, '')
+    // 函数名保留；这里只是确保没有 TS 残留
+    .trim();
+}
+
+// 注入到浏览器时，这些函数会改名（避免和页面自身的全局符号撞车），
+// 而且函数体内部的互相调用也必须跟着改 —— 只改 `function 旧名(` 会留下
+// 悬空引用：keyFor 里调 sessionIdFromPath()，但客户端只有 sidFromPath()。
+// 实测这个错误会让整个注入脚本在第一次 syncSession 时抛 ReferenceError，
+// 胶囊直接不出现（而 new Function(code) 语法检查是通的，抓不到）。
+const CLIENT_RENAMES = [
+  [isRealTurnIdForSession, 'isRealTurnIdX'],
+  [sessionFingerprintFrom, 'fpFromIds'],
+  [sessionIdFromPath, 'sidFromPath'],
+  [sessionKeyFor, 'keyFor'],
+  [migrateKeyWith, 'migrateWith'],
+];
+
+function renamedSource(fn, newName) {
+  let src = clientSourceOf(fn);
+  // 先把函数声明本身改名
+  src = src.replace(/^function\s+[A-Za-z0-9_$]+\s*\(/, 'function ' + newName + '(');
+  // 再把函数体里对**其它**待注入函数的调用改名
+  for (const [target, alias] of CLIENT_RENAMES) {
+    const oldName = target.name;
+    if (!oldName || oldName === newName) continue;
+    // 只替换作为函数调用出现的形态，避免误伤字符串/注释里的同名文本
+    src = src.replace(new RegExp('\\b' + oldName + '\\s*\\(', 'g'), alias + '(');
+  }
+  return src;
+}
+
+const CLIENT_HELPERS = CLIENT_RENAMES.map(([fn, alias]) => renamedSource(fn, alias)).join('\n');
+
 // ---------------------------------------------------------------- 客户端脚本
 //
 // 这段字符串会被原样发到浏览器。约束：
@@ -385,8 +557,93 @@ const CLIENT_JS = String.raw`
   var justSwitched = 0;
   var SWITCH_GRACE_MS = 1200;
 
+  // ---- 会话标识 ------------------------------------------------------------
+  //
+  // 缓存 key 必须能**唯一标识一个会话**，否则两个会话会共用一份记录，
+  // 表现就是「B 会话里出现 A 会话的历史节点」。
+  //
+  // 早先这里直接返回 location.pathname，对**已存在的会话**是准确的
+  // （路径就是 /sessions/session_<uuid>），但对「新建会话」不行：
+  // 应用自己的路径构造是
+  //     id 为空 → "/"        id 有值 → "/sessions/" + encodeURIComponent(id)
+  // （核对过 Desktop bundle 里的 $he() / EU() 两个函数）
+  // 也就是说，新会话在**拿到 id 之前**路径就是 "/"，
+  // 于是「新建会话 1」「新建会话 2」……全都落在同一个 key 上，互相污染。
+  //
+  // 修法分两层：
+  //   1. 路径是 /sessions/<id> → 直接用 <id>（最可靠，应用自己也这么解析）
+  //   2. 路径是别的（含 "/"）→ 用路径 + 「会话指纹」组成复合 key。
+  //      指纹取当前 DOM 里最小的真实 turn id（t0 / t1 …）。
+  //      一旦应用 replaceState 到 /sessions/<id>，立刻切到精确 key，
+  //      并把过渡期记录**迁移**过去（见 migrateKey）。
+  //
+  // 下面这几个函数是从模块级**原样注入**的（见 CLIENT_HELPERS），
+  // 不在这里重写一遍 —— 两份实现必然有一天不同步。
+  // 注入的函数名：fpFromIds / keyFor / migrateWith
+  ${CLIENT_HELPERS}
+
+  /**
+   * 会话指纹：当前 DOM 里最小的真实 turn id。
+   * 拿不到（还没渲染任何消息）返回 ''。
+   *
+   * 用「最小」而不是「最新」：用户往下滚会加载更多历史，最新那条一直在变，
+   * 最小那条（t0）在会话内是稳定的。
+   */
+  function sessionFingerprint() {
+    var nodes = document.querySelectorAll('.u-bub[data-turn-id]');
+    var ids = [];
+    for (var i = 0; i < nodes.length; i += 1) {
+      ids.push(nodes[i].getAttribute('data-turn-id') || '');
+    }
+    return fpFromIds(ids);
+  }
+
+  /**
+   * 当前会话的缓存 key。
+   *
+   * 形态：
+   *   /sessions/<uuid>  →  "s:<uuid>"            （精确，最常用）
+   *   其它路径          →  "p:<pathname>#<fp>"   （过渡态，靠指纹区分）
+   *
+   * 前缀 s:/p: 是为了让两种形态永不相撞 —— 万一某个会话 id 恰好叫
+   * "p:/"，加上前缀也不会串。
+   *
+   * 注意：真正的判定逻辑在 keyFor()（由 CLIENT_HELPERS 注入），这里只负责从 DOM 取
+   * turn id 再交给它。两边共用同一份实现，避免「改了一边忘了另一边」。
+   */
   function sessionKey() {
-    return (location && location.pathname) || '/';
+    return keyFor((location && location.pathname) || '/', sessionFingerprintIds());
+  }
+
+  /** 只取 id 列表（给 sessionKeyFor 用） */
+  function sessionFingerprintIds() {
+    var nodes = document.querySelectorAll('.u-bub[data-turn-id]');
+    var ids = [];
+    for (var i = 0; i < nodes.length; i += 1) {
+      ids.push(nodes[i].getAttribute('data-turn-id') || '');
+    }
+    return ids;
+  }
+
+  /**
+   * 过渡 key → 精确 key 的迁移。
+   *
+   * 新会话的时序是：路径 「/」（此时已经在记录）→ 应用 replaceState 到
+   * /sessions/<uuid>。如果不迁移，刚记下的节点会留在 「p:/#t0」 里，
+   * 而新 key 是空的 —— 用户会看到「刚发的消息不在目录里」，
+   * 直到下次重新采集。所以切换时把旧 key 的记录搬过去。
+   *
+   * 只在「旧 key 是过渡态、新 key 是精确态、且新 key 还没有记录」时迁移，
+   * 避免把 A 会话的内容搬进 B 会话。
+   *
+   * 判定逻辑在 migrateWith()（由 CLIENT_HELPERS 注入），这里只注入 localStorage 的存取。
+   */
+  function migrateKey(fromKey, toKey) {
+    return migrateWith(fromKey, toKey, {
+      getItem: function (k) { return localStorage.getItem(STORE_PREFIX + k); },
+      setItem: function (k, v) { localStorage.setItem(STORE_PREFIX + k, v); },
+      removeItem: function (k) { localStorage.removeItem(STORE_PREFIX + k); },
+    });
   }
 
   // 会话切换检测：换 key 时先把旧 key 的待写内容落盘，再清空内存重新加载。
@@ -401,6 +658,10 @@ const CLIENT_JS = String.raw`
     if (saveTimer) { clearTimeout(saveTimer); saveTimer = 0; }
     // 旧会话还有没写盘的改动 → 用旧 key 写掉，绝不能记到新会话名下
     if (dirty) saveStore(activeKey, storeH);
+    // 过渡态 → 精确态的迁移：新会话拿到 id 后，把「/」时期记下的节点
+    // 搬到 /sessions/<uuid> 名下，否则用户会看到「刚发的消息不在目录里」。
+    // 必须在下面 loadStore(k) 之前做，这样能直接读到迁移过来的数据。
+    migrateKey(activeKey, k);
     // 作废正在跑的预扫链（它还在写 scrollTop），并解除互斥
     preloadToken += 1;
     preloadAbort = false;
@@ -1462,15 +1723,15 @@ const CLIENT_JS = String.raw`
     }
     return false;
   }
-  function place() {
-    if (!root) return;
-    // 有浮层盖着就先藏起来。放在最前面：下面所有分支都在算坐标，
-    // 但此刻根本不该显示，算出来的位置都是错的。
-    if (overlayOn) {
-      placeOk = false;
-      root.classList.remove('on');
-      return;
-    }
+  function place() {
+    if (!root) return;
+    // 有浮层盖着就先藏起来。放在最前面：下面所有分支都在算坐标，
+    // 但此刻根本不该显示，算出来的位置都是错的。
+    if (overlayOn) {
+      placeOk = false;
+      root.classList.remove('on');
+      return;
+    }
     var wb = document.querySelector('.dock-workbar');
     var card = document.querySelector('.composer-card') || document.querySelector('.composer');
     var vh = window.innerHeight || 0;

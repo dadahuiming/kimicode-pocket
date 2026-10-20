@@ -104,3 +104,44 @@ test('RateLimiter.sweep 清掉过期桶', () => {
   rl.sweep();
   assert.equal(rl.map.size, 0);
 });
+
+// ---- 回归：v1.6.12 修掉的几个会导致「整站掉线」的缺陷 ----------------------
+
+test('畸形 Cookie 不能让解析抛错（否则一个请求就能打挂整个代理）', () => {
+  // 真实复现：`Cookie: pocket_session=%E0%A4%A` 会让 decodeURIComponent
+  // 抛 URIError；这个调用发生在 async 请求处理器里，异常变成未处理的
+  // Promise rejection，Node 默认直接 process.exit(1)。
+  // 任何人都能发这一个请求 —— 也就是零成本远程 DoS。
+  assert.doesNotThrow(() => parseCookies('pocket_session=%E0%A4%A'));
+  assert.deepEqual(parseCookies('pocket_session=%E0%A4%A'), {});
+});
+
+test('畸形 Cookie 只跳过坏的那个，好 Cookie 照常解析', () => {
+  const c = parseCookies('good=1; bad=%E0%A4%A; also=2');
+  assert.equal(c.good, '1');
+  assert.equal(c.also, '2');
+  assert.equal('bad' in c, false);
+});
+
+test('正常的百分号编码 Cookie 仍然会被解码', () => {
+  assert.equal(parseCookies('a=%E4%BD%A0%E5%A5%BD').a, '你好');
+});
+
+test('FailureLimiter 会清理过期记录（否则配伪造 IP 会无限涨）', () => {
+  let clock = 0;
+  const fl = new FailureLimiter({ max: 5, windowMs: 60_000, now: () => clock });
+  for (let i = 0; i < 50; i += 1) fl.recordFailure(`1.2.3.${i}`);
+  assert.equal(fl.map.size, 50);
+  clock = 120_000;
+  fl.sweep();
+  assert.equal(fl.map.size, 0);
+});
+
+test('FailureLimiter.sweep 不会误删仍在锁定中的记录', () => {
+  let clock = 0;
+  const fl = new FailureLimiter({ max: 5, windowMs: 60_000, now: () => clock });
+  fl.recordFailure('x');
+  clock = 30_000;
+  fl.sweep();
+  assert.equal(fl.map.size, 1, '尚未过期，必须保留');
+});
