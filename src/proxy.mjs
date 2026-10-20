@@ -38,6 +38,7 @@ import { parseArgs, parsePairCount, MAX_PAIR_COUNT } from './lib/args.mjs';
 import { createDiscovery } from './lib/discovery.mjs';
 import { rewriteHeaders, rewriteRawHeaders, isLocalRequest, clientIp } from './lib/rewrite.mjs';
 import { shouldTrim, trimJsonBuffer, formatStats } from './lib/trim.mjs';
+import { injectTurnNav, shouldInjectNav, MAX_HTML_BYTES } from './lib/toc.mjs';
 import {
   newSessionToken,
   verifySessionToken,
@@ -56,7 +57,7 @@ const CREDENTIAL_TTL_DAYS = 7;
 const MAX_LOG_BYTES = 5 * 1024 * 1024;
 const LOG_FLUSH_MS = 500;
 const LOG_FLUSH_LINES = 64;
-const VERSION = '1.5.1';
+const VERSION = '1.6.11';
 
 const HELP = `KimiCode Pocket ${VERSION}
 
@@ -234,6 +235,133 @@ function logAccess(req, res, status, startedAt, bytes) {
   // 异常状态（401/403/429/5xx）立刻落盘：真出事时这几行最值钱，
   // 不能让它们躺在 0.5 秒的缓冲区里等着被硬杀丢掉。
   if (status >= 400) flushLog();
+}
+
+/**
+ * 记录「大响应对端到底收全了没有」。
+ *
+ * 必须单独记，因为 res 的 finish 事件只表示数据交给了内核缓冲区，
+ * **不代表对端收到**。用户实测报过一次：
+ *
+ *   HTTP 200、2063ms、失败阶段 parse、TypeError: Failed to fetch
+ *   （代理日志写着 200 13384621B，看起来一切正常）
+ *
+ * 查下来是他手机在传输途中换了出口 IP（157.61.160.31 → 111.55.210.62），
+ * 那条 TCP 连接直接失效。代理把 13MB 全写进缓冲区就记了「成功」，
+ * 从日志完全看不出对端没收到 —— 这个盲区必须补，否则下次还是查不出来。
+ *
+ * 用 socket.bytesWritten 的**增量**（不是绝对值）：keep-alive 下同一 socket
+ * 会复用给多个响应，绝对值里混着别的请求。大响应期间基本独占，够用。
+ */
+const deliveryStart = new WeakMap();
+
+function trackDelivery(res) {
+  if (res.socket) deliveryStart.set(res, res.socket.bytesWritten || 0);
+}
+
+/**
+ * 分块写一个 body，让「客户端中途断掉」有机会被观测到。
+ *
+ * 为什么不能直接 res.end(body)：那是一次性把整个 body 塞进内核缓冲区。
+ * 实测 6MB 在本地回环 4ms 就写完了，此时 writableFinished=true、
+ * bytesWritten 是完整值 —— 服务端**根本无从得知**对端没读。
+ * 这正是用户那次「HTTP 200 但 Failed to fetch」在日志里完全看不出来的原因。
+ *
+ * 分块 + 等 drain 之后，一旦对端消失，socket 会抛 ECONNRESET 且
+ * writableFinished 保持 false，这时才真正可判定。
+ * 实测 20MB / 客户端 576KB 后断开：375ms 时拿到
+ *   sock-err:ECONNRESET | finished=false | destroyed=true | wrote=4480KB
+ */
+function writeChunked(res, body, chunkSize = 64 * 1024) {
+  return new Promise((resolve) => {
+    let off = 0;
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      resolve();
+    };
+    res.on('error', finish);
+    res.on('close', finish);
+    const pump = () => {
+      if (done) return;
+      if (off >= body.length) {
+        res.end();
+        finish();
+        return;
+      }
+      let ok = false;
+      try {
+        ok = res.write(body.subarray(off, off + chunkSize));
+      } catch {
+        finish();
+        return;
+      }
+      off += chunkSize;
+      if (ok) setImmediate(pump);
+      else res.once('drain', pump);   // 背压：等内核缓冲区腾空
+    };
+    pump();
+  });
+}
+
+function reportDelivery(req, res, declaredBytes) {
+  if (!declaredBytes || declaredBytes < 512 * 1024) return;   // 小响应不记
+  if (res.writableFinished) return;                            // 正常写完
+  let wrote = 0;
+  try {
+    const base = deliveryStart.get(res);
+    const now = res.socket ? res.socket.bytesWritten || 0 : 0;
+    wrote = base === undefined ? now : Math.max(0, now - base);
+  } catch {
+    /* socket 已销毁，拿不到就记 0 */
+  }
+  let path = req.url ?? '/';
+  const q = path.indexOf('?');
+  if (q >= 0) path = path.slice(0, q);
+  log(
+    `传输中断 ${clientIp(req)} ${req.method} ${path}: ` +
+      `声明 ${declaredBytes}B，实际写出 ${wrote}B —— 客户端没收到完整响应`,
+  );
+  flushLog();   // 这条最值钱，立刻落盘
+}
+
+/**
+ * 压缩路径专用的中断观测。
+ *
+ * 为什么不能复用 reportDelivery：压缩是用 z.pipe(res) 输出的，
+ * 压缩流会把数据一路推进内核缓冲区，等到 close 事件时
+ * writableFinished 往往已经是 true —— 实测 br/gzip 两条路径都测不出来，
+ * 而这个观测恰好只在压缩路径上才真正有用（浏览器一律带 Accept-Encoding）。
+ *
+ * 可靠信号是 socket 上的 ECONNRESET / EPIPE：
+ * 对端消失时内核会先给 socket 一个 error，再 close。
+ * 实测「12MB 随机数据 + 客户端 300KB 后断开」：
+ *   sock-err:ECONNRESET | finished=false | destroyed=true
+ * 所以这里盯 socket error，而不是 res 的完成状态。
+ */
+function watchCompressedDelivery(req, res, declaredBytes) {
+  if (!declaredBytes || declaredBytes < 512 * 1024) return;
+  const sock = res.socket;
+  if (!sock) return;
+  let broken = false;
+  const onErr = (e) => {
+    if (broken) return;
+    broken = true;
+    let path = req.url ?? '/';
+    const q = path.indexOf('?');
+    if (q >= 0) path = path.slice(0, q);
+    log(
+      `传输中断 ${clientIp(req)} ${req.method} ${path}: ` +
+        `声明 ${declaredBytes}B，客户端没收到完整响应（${e.code || 'socket-error'}）`,
+    );
+    flushLog();
+  };
+  sock.on('error', onErr);
+  res.on('close', () => {
+    // close 之后 socket 可能还能读到 error 标志；已写过就不重复记
+    if (!broken && sock.errored) onErr(sock.errored);
+  });
 }
 
 // ---- 实例发现 ---------------------------------------------------------------
@@ -867,6 +995,69 @@ const server = http.createServer(async (req, res) => {
     (proxyRes) => {
       const hdrs = { ...proxyRes.headers };
 
+      // ---- 轮次导航注入 ----------------------------------------------------
+      // 桌面端右侧有「对话目录」，但组件里写死了 `!mobile`，而 mobile 就是
+      // `(max-width: 640px)` —— 手机上一律不渲染。这里在 HTML 里补一段脚本，
+      // 用官方的 data-turn-id 自己画一个胶囊，贴在输入框右上角。
+      //
+      // 为什么在代理做而不是改 Kimi 的包：见 lib/toc.mjs 顶部注释。
+      if (shouldInjectNav(req, proxyRes, cfg.turnNav)) {
+        void (async () => {
+          const chunks = [];
+          let size = 0;
+          let overflow = false;
+          try {
+            for await (const chunk of proxyRes) {
+              chunks.push(chunk);
+              size += chunk.length;
+              if (size > MAX_HTML_BYTES) {
+                // 上游没给 content-length 且体量失控：不再缓冲，已读部分当降级内容
+                overflow = true;
+                break;
+              }
+            }
+            const raw = Buffer.concat(chunks);
+            if (overflow) {
+              log(`轮次导航注入跳过 ${pathname}: HTML 超过 ${MAX_HTML_BYTES} 字节`);
+              const h = { ...hdrs };
+              delete h['content-length'];
+              h['content-length'] = String(raw.length);
+              res.writeHead(200, h);
+              res.end(raw);
+              logAccess(req, res, 200, startedAt, raw.length);
+              return;
+            }
+            const html = injectTurnNav(raw.toString('utf8'));
+            const out = Buffer.from(html, 'utf8');
+            const h = { ...hdrs };
+            delete h['content-length'];
+            delete h['transfer-encoding'];
+            h['content-length'] = String(out.length);
+            res.writeHead(200, h);
+            res.end(out);
+            logAccess(req, res, 200, startedAt, out.length);
+          } catch (e) {
+            // 注入失败绝不能拖垮首页：只要能拿到原始 HTML 就原样发。
+            log(`轮次导航注入跳过 ${pathname}: ${e.message}`);
+            if (!res.headersSent) {
+              const raw = Buffer.concat(chunks);
+              if (raw.length > 0) {
+                res.writeHead(200, { ...hdrs, 'content-length': String(raw.length) });
+                res.end(raw);
+                logAccess(req, res, 200, startedAt, raw.length);
+              } else {
+                res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' });
+                res.end('页面读取失败');
+                logAccess(req, res, 502, startedAt);
+              }
+            } else {
+              res.end();
+            }
+          }
+        })();
+        return;
+      }
+
       // ---- 大响应瘦身（优先于压缩）------------------------------------------
       // transcript / messages 里工具截图是 base64 PNG。实测 /transcript 51MB
       // 里 48.6MB 是 38 张截图（95.4%），文字只有 1.95MB。
@@ -919,6 +1110,19 @@ const server = http.createServer(async (req, res) => {
                 formatStats(result.stats),
             );
 
+            // 记录「对端到底收全了没有」。瘦身后的响应仍有几 MB，
+            // 是弱网中途断掉的重灾区；不记的话日志里只会看到「200 成功」。
+            //
+            // 这里传的是**未压缩**的 body.length，不是 content-length：
+            // 压缩路径会删掉 content-length 改用 chunked，那时代理会把
+            // reportDelivery 里的判据当成 0 而直接跳过 —— 实测 br/gzip 下
+            // 中断完全记不下来，等于这个观测在真实使用路径上是失效的。
+            // 用未压缩大小当阈值是安全的：它只会让「更小的实际传输」也进统计。
+            trackDelivery(res);
+            res.on('close', () => reportDelivery(req, res, body.length));
+            // 压缩路径另用一个观测（writableFinished 在那儿不可靠）
+            watchCompressedDelivery(req, res, body.length);
+
             // 裁剪后一般只有几百 KB，压缩收益有限；但手机流量仍是钱，
             // 保留压缩（条件与 shouldCompress 一致，只是不看 size 门槛）。
             if (cfg.compress && req.method !== 'HEAD' && pickEncoding(req)) {
@@ -935,11 +1139,15 @@ const server = http.createServer(async (req, res) => {
               res.on('close', () => z.destroy());
               // 先接管道再写入：写成 z.end(body, () => z.pipe(res)) 会让
               // 压缩流在 pipe 接上之前就结束，数据全丢、连接挂到超时。
+              // 交给管道处理背压即可 —— 压缩流本身会分块输出，
+              // 天然不会一次性把几 MB 全灌进内核缓冲区。
               z.pipe(res);
               z.end(body);
             } else {
               res.writeHead(proxyRes.statusCode ?? 502, out);
-              res.end(body);
+              // 分块写：一次性 end 会让 6MB 在几毫秒内全部进内核缓冲区，
+              // 于是「对端没读」这件事在服务端完全不可见（见 writeChunked 注释）。
+              await writeChunked(res, body);
             }
             logAccess(req, res, proxyRes.statusCode ?? 502, startedAt, body.length);
           } catch (e) {
@@ -994,6 +1202,12 @@ const server = http.createServer(async (req, res) => {
       }
 
       res.on('finish', () => logAccess(req, res, proxyRes.statusCode ?? 502, startedAt));
+      // 未走瘦身的透传路径也可能很大（比如被 trim 排除的路径）。
+      // 只在大响应上挂钩，避免每个请求都多挂一个 close 监听。
+      const passLen = Number(proxyRes.headers['content-length'] ?? 0);
+      if (passLen >= 512 * 1024) {
+        res.on('close', () => reportDelivery(req, res, passLen));
+      }
     },
   );
 

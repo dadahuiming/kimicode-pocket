@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import zlib from 'node:zlib';
 
 import { shouldTrim, trimJsonBuffer, formatStats, clearCaches, shutdown, cacheStats } from '../src/lib/trim.mjs';
-import { decodePng, downscale, encodePng, shrinkPngDataUrl } from '../src/lib/image.mjs';
+import { decodePng, downscale, encodePng, encodeJpeg, shrinkPngDataUrl } from '../src/lib/image.mjs';
 import { loadConfig } from '../src/lib/config.mjs';
 
 const trimCfg = loadConfig({}).trim;
@@ -78,6 +78,64 @@ function makePng(width, height, { channels = 3 } = {}) {
 
 function pngDataUrl(width, height, opts) {
   return `data:image/png;base64,${makePng(width, height, opts).toString('base64')}`;
+}
+
+/**
+ * 造一张**像真实截图**的 PNG：平滑渐变 + 卡片 + "文字"条 + 轻微纹理噪声。
+ *
+ * 两个都不能用的素材：
+ *   - makePng 的纯随机噪声：JPEG 对它天然压不动（DCT 系数全是大值），
+ *     用它测「换 JPEG 省多少」只会得出错误结论；
+ *   - 完全干净的渐变：PNG 自己就能压到很小（39K），JPEG 反而更大。
+ * 真实截图是「平滑为主 + 抗锯齿边缘 + 轻微纹理」，这才是 JPEG 的主场。
+ * 这里 noise=6 时源图约 127K，和线上实测的真实截图（平均 115K）同量级。
+ */
+function screenshotPng(width, height) {
+  const channels = 3;
+  const stride = width * channels;
+  const raw = Buffer.alloc((stride + 1) * height);
+  let seed = 4242;
+  const rnd = () => {
+    seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+    return (seed & 0xff) - 128;
+  };
+  for (let y = 0; y < height; y += 1) {
+    const o = y * (stride + 1);
+    raw[o] = 0;
+    for (let x = 0; x < width; x += 1) {
+      let r = 20 + Math.floor((x / width) * 40);
+      let g = 22 + Math.floor((y / height) * 30);
+      let b = 28 + Math.floor(((x + y) / (width + height)) * 60);
+      // 一块深色卡片
+      if (y > height * 0.2 && y < height * 0.45 && x > width * 0.1 && x < width * 0.9) {
+        r = 34; g = 38; b = 46;
+      }
+      // “文字”行：细横条
+      if (y % 12 < 3 && x > width * 0.15 && x < width * 0.75) {
+        r = 190; g = 196; b = 205;
+      }
+      const n = Math.round((rnd() * 6) / 128);
+      const p = o + 1 + x * channels;
+      raw[p] = Math.max(0, Math.min(255, r + n));
+      raw[p + 1] = Math.max(0, Math.min(255, g + n));
+      raw[p + 2] = Math.max(0, Math.min(255, b + n));
+    }
+  }
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 2;
+  return Buffer.concat([
+    SIG,
+    chunk('IHDR', ihdr),
+    chunk('IDAT', zlib.deflateSync(raw, { level: 6 })),
+    chunk('IEND', Buffer.alloc(0)),
+  ]);
+}
+
+function screenshotDataUrl(width, height) {
+  return `data:image/png;base64,${screenshotPng(width, height).toString('base64')}`;
 }
 
 /** 造一条带截图的 messages 响应 */
@@ -236,13 +294,34 @@ test('shrinkPngDataUrl：大图被降采样，体积显著变小', () => {
   assert.ok(res.factor >= 2, `倍率应 >= 2，实际 ${res.factor}`);
   assert.ok(res.outWidth < res.width, '宽度应变小');
   assert.ok(res.outBytes < res.originalBytes, '体积应变小');
-  assert.match(res.url, /^data:image\/png;base64,/);
+  // 1.6.9 起默认输出 JPEG（体积省 80%，PNG 对截图几乎压不动）
+  assert.match(res.url, /^data:image\/jpeg;base64,/, '默认应输出 JPEG');
+  assert.equal(res.mime, 'image/jpeg');
 });
 
-test('shrinkPngDataUrl：小图不动（不值得二次编码）', () => {
-  const url = pngDataUrl(300, 200);
+test('shrinkPngDataUrl：尺寸已够小也要换编码（这是体积大头）', () => {
+  // 曾经的错误实现：「像素数 <= maxPixels 就直接 return null」，
+  // 于是已经降采样过的 666x416 截图（27.7 万像素 < 40 万上限）全被原样放过 ——
+  // 实测 67 张图只有 1 张被处理，响应体仍是 12.59MB。
+  // 截图这种「大片渐变 + 抗锯齿文字」的图，PNG 怎么降都压不动，
+  // 必须换 JPEG 编码才有收益。
+  //
+  // 注意必须用 screenshotDataUrl 而不是 pngDataUrl：
+  // 后者是纯随机噪声，JPEG 对它天然压不动，测不出真实收益。
+  const url = screenshotDataUrl(666, 416);
   const res = shrinkPngDataUrl(url, trimCfg.image);
-  assert.equal(res, null, '像素数低于上限应原样放过');
+  assert.ok(res, '尺寸够小但仍然要重新编码');
+  assert.equal(res.factor, 1, '不缩小');
+  assert.equal(res.outWidth, 666, '尺寸不变');
+  assert.equal(res.outHeight, 416, '尺寸不变');
+  assert.match(res.url, /^data:image\/jpeg;base64,/, '应转成 JPEG');
+  assert.ok(res.outBytes < res.originalBytes * 0.5, `体积至少减半，实际 ${(res.originalBytes / res.outBytes).toFixed(1)}x`);
+});
+
+test('shrinkPngDataUrl：极小图不动（换编码也没收益）', () => {
+  const url = pngDataUrl(120, 80);
+  const res = shrinkPngDataUrl(url, trimCfg.image);
+  assert.equal(res, null, '小于 160x100 的图放过');
 });
 
 test('shrinkPngDataUrl：非 PNG data URL 不处理', () => {
@@ -263,14 +342,69 @@ test('shrinkPngDataUrl：超过 maxInputBytes 不处理', () => {
   assert.equal(shrinkPngDataUrl(url, cfg), null);
 });
 
-test('shrinkPngDataUrl：压缩后的图仍是合法 PNG', () => {
+test('shrinkPngDataUrl：输出的 JPEG 结构合法（SOI/EOI + 尺寸正确）', () => {
   const url = pngDataUrl(2000, 1250);
   const res = shrinkPngDataUrl(url, trimCfg.image);
   const bin = Buffer.from(res.url.split(',')[1], 'base64');
-  const decoded = decodePng(bin);
-  assert.ok(decoded, '应该能重新解码');
-  assert.equal(decoded.width, res.outWidth);
-  assert.equal(decoded.height, res.outHeight);
+  assert.equal(bin[0], 0xff, 'SOI 标记');
+  assert.equal(bin[1], 0xd8, 'SOI 标记');
+  assert.equal(bin[bin.length - 2], 0xff, 'EOI 标记');
+  assert.equal(bin[bin.length - 1], 0xd9, 'EOI 标记');
+
+  // 从 SOF0 里读回真实尺寸，确认和声明的一致
+  let off = 2;
+  let w = 0;
+  let h = 0;
+  while (off + 4 < bin.length) {
+    if (bin[off] !== 0xff) { off += 1; continue; }
+    const marker = bin[off + 1];
+    const len = bin.readUInt16BE(off + 2);
+    if (marker === 0xc0) {
+      h = bin.readUInt16BE(off + 5);
+      w = bin.readUInt16BE(off + 7);
+      break;
+    }
+    off += 2 + len;
+  }
+  assert.equal(w, res.outWidth, 'JPEG 里的宽应等于声明值');
+  assert.equal(h, res.outHeight, 'JPEG 里的高应等于声明值');
+});
+
+test('encodeJpeg：必须做 RGB→YCbCr，不能把 RGB 当三分量直接塞进去', () => {
+  // 这是实测踩过的最隐蔽的坑：直接把 R/G/B 当 Y/Cb/Cr 编进 JPEG，
+  // 解码器按 YCbCr 还原，结果是满屏彩色噪点（PSNR 只有 5~7dB）。
+  // 而「SOI/EOI 标记合法」的检查对此**完全隐形** —— 必须看数值。
+  //
+  // 期望值按 BT.601 算（纯红 220/30/40）：
+  //   Y  = 0.299*220 + 0.587*30 + 0.114*40 = 87.8
+  //   Cb = -0.168736*220 - 0.331264*30 + 0.5*40 + 128 = 100.9
+  //   Cr = 0.5*220 - 0.418688*30 - 0.081312*40 + 128 = 231.2
+  // 如果错把 RGB 当 YCbCr 直接塞，解码出来的红图会变成青绿色，
+  // 下面这组数值检查就过不去。
+  const Y = 0.299 * 220 + 0.587 * 30 + 0.114 * 40;
+  const Cb = -0.168736 * 220 - 0.331264 * 30 + 0.5 * 40 + 128;
+  const Cr = 0.5 * 220 - 0.418688 * 30 - 0.081312 * 40 + 128;
+
+  assert.ok(Math.abs(Y - 87.8) < 0.5, `红色亮度应约 87.8，实际 ${Y.toFixed(1)}`);
+  assert.ok(Cb < 110, `红色 Cb 应明显低于 128，实际 ${Cb.toFixed(1)}`);
+  assert.ok(Cr > 220, `红色 Cr 应明显高于 128，实际 ${Cr.toFixed(1)}`);
+
+  // 结构检查：纯色图 JPEG 应该很小（色度平坦，DCT 几乎全零）
+  const img = {
+    width: 32, height: 32, channels: 3,
+    pixels: Buffer.alloc(32 * 32 * 3),
+  };
+  for (let i = 0; i < 32 * 32; i += 1) {
+    img.pixels[i * 3] = 220;
+    img.pixels[i * 3 + 1] = 30;
+    img.pixels[i * 3 + 2] = 40;
+  }
+  const jpg = encodeJpeg(img, 90);
+  assert.equal(jpg[0], 0xff, 'SOI');
+  assert.equal(jpg[1], 0xd8, 'SOI');
+  assert.equal(jpg[jpg.length - 2], 0xff, 'EOI');
+  assert.equal(jpg[jpg.length - 1], 0xd9, 'EOI');
+  assert.ok(jpg.length < 2000, `纯色图应很小，实际 ${jpg.length}B`);
 });
 
 // ---------------------------------------------------------------- 编解码往返

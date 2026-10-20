@@ -11,7 +11,7 @@
 [![Cloudflare Tunnel](https://img.shields.io/badge/Cloudflare-Tunnel-F38020?logo=cloudflare&logoColor=white)](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-0078D6)](#platform-parity)
-[![Tests](https://img.shields.io/badge/tests-135%20passing-brightgreen)](#development--testing)
+[![Tests](https://img.shields.io/badge/tests-183%20passing-brightgreen)](#development--testing)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)](package.json)
 
 </div>
@@ -481,6 +481,7 @@ Command-line flags win over the same-named environment variable.
 | `POCKET_TRIM_MIN_KB` | `256` | Responses smaller than this are not processed |
 | `POCKET_TRIM_MAX_BUFFER_MB` | `128` | Responses larger than this are not buffered |
 | `POCKET_TRIM_PATHS` | `transcript,messages` | Paths to process (case-insensitive substring) |
+| `POCKET_TOC` | `1` | "History nodes" capsule on phones (see "History nodes" below) |
 | `POCKET_ACCESS_LOG` | `1` | Access log |
 | `POCKET_RATE_LIMIT` | `600` | Requests per minute per IP, `0` disables |
 | `POCKET_PAIR_TTL_SEC` | `180` | One-time code lifetime in seconds (min 30) |
@@ -570,6 +571,301 @@ read it as "how many were ever issued":
 
 ---
 
+## History nodes (restores the desktop rail on phones)
+
+### Why the desktop has it and the browser does not
+
+On a desktop, long sessions show a thin column of bars on the right — one per turn,
+the current one taller, click to jump. That is the built-in "conversation outline".
+On a phone it never appears, and the reason is **not** missing data — the component
+hard-codes a condition:
+
+```js
+const u = D(() => !n.mobile && !n.sessionLoading && n.items.length > 1);
+//                 ↑ this one
+const $8e = 640, z8e = `(max-width: ${$8e}px)`;   // definition of `mobile`
+```
+
+`mobile` is `matchMedia('(max-width: 640px)')` — **pure width, no UA sniffing**.
+Both surfaces read the same data through the same `/transcript` endpoint; the only
+difference is one media query. Below 640px the component simply does not render.
+
+> Self-check: on a desktop browser, drag the window narrower than 640px — the rail
+> disappears; widen it and it comes back.
+
+### What this project does
+
+The proxy injects a small script (~30KB, inline, zero dependencies, no CSP conflict)
+into `index.html` and draws its own capsule labelled **"History nodes"**, styled
+**exactly like the system pills above the composer** (28px tall, 14px text, 10px
+radius, glass background), pinned to the right end of that same row:
+
+```
+[ Background Bash ] [ Background Agent ]        [ History nodes ]
+┌──────────────────────────────────────────────────────────────┐
+│  Type a message…                                              │
+└──────────────────────────────────────────────────────────────┘
+```
+
+Tap it for a node list that pops **upward**; the current node is taller and brighter,
+tap any row to glide there and flash it.
+
+### Node source: user messages only
+
+The official rail lists **what the user sent**; agent replies are not nodes.
+This must match exactly, and the discriminator is the class the host provides:
+
+| class | what it is | in the rail |
+|---|---|---|
+| `.u-bub` | user message (including same-turn follow-ups such as `t8.41.f1`) | yes |
+| `.a-msg` | agent reply (`t8.1.f1` / `t8.41.f2`, up to thousands of px tall) | no |
+
+Note that the **`.fN` suffix says nothing about whether it is an agent reply**:
+`t8.41.f1` is a user bubble while `t8.41.f2` is an agent reply. Assuming all
+`.fN` ids were assistant frames and switching to a catch-all query once put
+"worked for 1m37s..." style agent output into the list.
+
+### Source, part two: optimistic messages are not nodes either
+
+Matching `.u-bub` alone is not enough. The moment you send, the front end inserts a
+local placeholder user message so the bubble appears instantly; when the server
+responds it is swapped for the real turn. That placeholder also carries
+`.u-bub[data-turn-id]`:
+
+| Situation | id shape |
+|---|---|
+| Plain send | `msg_opt_<base36 time>_<counter>` |
+| `/skill` trigger | `msg_skill_opt_<base36 time>` |
+| Steer / forward | `msg_opt_steer_<promptId>` |
+
+It disappears from the DOM once the real turn (`t<n>:input`) arrives, but **the
+record already written to localStorage does not** — leaving a ghost node that can
+never be jumped to, parked at the bottom of the list. This is exactly what a user
+reported from a screenshot: "the session only has 2 nodes, but the history list
+shows 3".
+
+There is one criterion: **a real turn always starts with `t<number>`**
+(`isRealTurnId`). It is applied in four places — `collect`, `recordFromDom`,
+`findNode` and `loadStore` — the last one so that existing users lose their legacy
+ghost nodes automatically instead of having to clear storage by hand.
+
+### Three trade-offs that matter
+
+**1. The node key is the whole `turnId` string, not a turn number.**
+The desktop rail shows 11 nodes; an earlier build of this capsule showed only 9 —
+because it deduplicated on a `t(\d+)` ordinal, merging a steered follow-up
+(`t0.41.f1`) with the turn opener (`t0:input`). Keying on the full `turnId`
+restores a 1:1 match with the desktop rail, and the list no longer shows any
+ordinal at all (the numbering contains `task` placeholder turns, so no "turn N"
+ever matches what the user counts).
+
+**2. Smooth scrolling reuses the browser's native `scroll-behavior:smooth`
+instead of a hand-rolled rAF loop.**
+
+| Approach | Frame cost on a 30k-px session |
+|---|---|
+| Hand-rolled rAF writing `scrollTop` each frame | 14 of 40 frames over 33ms, **p95 = 183ms**, max 283ms |
+| Native `scroll-behavior:smooth` | p50 = p95 = **17ms**, zero long tasks |
+
+The reason is concrete: the rAF version has to synchronously read `scrollHeight`
+and element positions every frame to advance, which forces the browser to reflow
+repeatedly mid-scroll. CSS smooth scrolling runs on the compositor and never
+touches the main thread.
+
+This also **fixes the desktop rail for free**: when the official rail is clicked the
+script temporarily adds `scroll-behavior:smooth` to the scroll container, so its own
+`scrollTop = X` assignment becomes a compositor-driven glide. The moment the user
+scrolls, touches, presses a key or `scrollend` fires, it is removed — the app's
+own follow-the-latest behaviour is never affected.
+
+**3. Locating a node uses `aria-posinset` estimation plus binary narrowing,
+not stored absolute pixels.**
+
+Three approaches were measured and disproven first:
+
+| Approach | Why it fails |
+|---|---|
+| Creeping toward a cached offset in small steps | Stepping outruns rendering: the virtual list needs 150-330ms to mount new rows, so a check every 80ms never sees the target |
+| Judging direction from the largest rendered `turnId` | Kimi keeps the last user message (`t8:input`) in the DOM as a **permanent anchor**; it is larger than any early target, so the test always says "target is below" |
+| Storing absolute pixels (`y`) | Document height changes while scrolling (35k-55k in one session). Measured: `t6` was off by 12k px after scaling — a dozen screens |
+
+What works is the row ordinal the virtual list **exposes itself**, `aria-posinset`:
+
+```
+t0:input=1  t2:input=8  t3:input=10  t5:input=14  t7:input=18  t8:input=20
+(aria-setsize is always 23)
+```
+
+It is independent of pixels and stable at any scroll position. Scaling by
+`pos/size` lands on target on the first try almost every time; if it misses,
+binary search takes over (using the row nearest the viewport probe line as the
+signal, read only after rendering has settled — otherwise you read the previous
+screen).
+
+### Jumping: locate first, then glide
+
+The real reason jumping to an earlier node feels janky is that the **search phase
+has to make repeated large jumps**, and each one makes the virtual list re-layout a
+big chunk (measured p95 = 83ms). The search cannot be avoided, but it can be kept
+inconspicuous:
+
+```
+tap -> scale the cached position by document height and jump straight there
+       (hits on the first try most of the time)
+    -> miss: advance 6 screens per step in the right direction until the target
+       enters the rendered range
+    -> still missed: dense sweep of +/-8 screens around the cached position
+       (covers the case where a stepped jump skipped past it)
+    -> target is in the DOM -> scroll-behavior:smooth centres it
+    -> closed-loop landing correction (re-layout can leave a few dozen pixels off)
+```
+
+Measured at a 420x860 phone viewport, tapping upward to earlier nodes:
+
+| Metric | Result |
+|---|---|
+| Landed | **5 of 5 inside the viewport** |
+| Timing | 335-1473ms, avg 647ms, 4 of 5 under 1s |
+
+**1.6.6 removed a full-screen overlay (the "veil").** It existed to hide the search
+phase, but measurements showed it *was* the flash: every jump meant a 150ms
+full-screen fade, worse the further it jumped. Removing it made the flash disappear
+without hurting accuracy.
+
+Known limitation, stated plainly: **60fps end-to-end is not achieved.** Stepped
+instant jumps still produce long frames. Short `scroll-behavior:smooth` segments
+measure p50 = p95 = max = 17ms with zero dropped frames, but the app itself keeps
+writing `scrollTop` during the scroll and interrupts those segments (a 1.4-screen
+segment does not even finish before being pulled back). That remains unsolved.
+
+### When it is not shown
+
+The capsule sits on the composer row, so **when the composer is not really there,
+it should not be either**. Three cases hide it:
+
+| Case | Criterion |
+|---|---|
+| An overlay covers it | `.sheet-root` / `.sheet-scrim` / `[role=dialog]` / `[aria-modal]` occupying at least 60% x 30% of the viewport |
+| The session has not rendered yet | the `chatRendered` latch has not been set (a warm cache does not count) |
+| The composer is scrolled out | the workbar rect does not intersect the viewport |
+
+Overlay detection **cannot use `elementFromPoint` hit-testing**: the capsule's
+`z-index` is `2147483002`, the highest on the page, so the hit always lands on the
+capsule itself and tells you nothing about what is underneath.
+
+The overlay state also has to go into `posSig` (the placement signature). Adding
+only the check without the signature means that when the overlay closes the
+signature is unchanged, `place()` is never called again, `placeOk` stays false
+forever and the capsule never comes back. That is exactly what happened on the
+first attempt at 1.6.8.
+
+The "session not rendered yet" rule uses a dedicated `chatRendered` latch instead
+of "at least one `.u-bub` is currently rendered": when the virtual list sits over a
+long stretch between two user bubbles the viewport can contain none of them, and
+the capsule would flicker away.
+
+### Why images are re-encoded as JPEG
+
+The bulk of a long session is tool screenshots. Measured on one session's
+`/transcript`:
+
+```
+83.79MB raw -> 12.59MB (resolution only, still PNG)
+of which 67 images still accounted for 7.08MB of that 66.49MB
+```
+
+Measured across those images (avg 115KB, all RGB with no alpha):
+
+| Approach | Avg size | Result |
+|---|---|---|
+| Re-encode as PNG | 115KB | 0% — PNG barely compresses screenshots |
+| PNG at 1/4 the pixels | 63KB | 45% saved, but visibly blurry |
+| **JPEG q80** | **21KB** | **81% saved, same dimensions, PSNR 38-39dB** |
+
+Encode time is effectively identical (33.8ms vs 32.8ms), so switching to JPEG is
+pure gain. The encoder is a hand-written baseline JPEG (the project stays
+dependency-free) with 4:2:0 chroma subsampling.
+
+**One easy mistake to avoid**: do not "optimise" by skipping images whose pixel
+count is already under the cap. The original implementation did exactly that and
+processed only 1 of 67 images — while those already-downsampled 666x416
+screenshots were precisely the bulk of the payload. The correct rule is "do not
+downscale, but still re-encode".
+
+Production: images 66.49MB -> 1696KB (-97.5%), wire size 7.13MB -> 1.68MB (-76%).
+
+### Interrupted transfers get logged
+
+`res.on('finish')` only means the data was **handed to the kernel buffer**; it does
+not mean the peer received it. A 6MB body measures as fully written in 4ms on
+loopback, at which point `writableFinished=true` and `bytesWritten` is the complete
+value — the server has no way to know the user received nothing.
+
+Large responses are therefore written **in chunks and drained**: once the peer
+disappears the socket raises `ECONNRESET` and `writableFinished` stays false. The
+compressed path needs its own handling, because `z.pipe(res)` pushes data straight
+into the kernel and `writableFinished` is true there as well — only the socket
+`error` event is reliable.
+
+The log then gains a line like this:
+
+```
+传输中断 1.2.3.4 GET /api/v1/sessions/.../transcript:
+  声明 5989618B，实际写出 3932637B — the client did not receive the full response
+```
+
+Without it, "Failed to fetch on the phone while the log says 200" is impossible to
+diagnose.
+
+### Preloading and persistence
+
+Opening a session actually fetches the **entire transcript** up front (measured:
+22 items / 9 turns / 2.1MB, `has_more=false`). Nodes are not "unloaded", they are
+simply **not rendered**. Sweeping a whole long session is expensive though (3万px
+needs 40+ screens), so:
+
+- Only the **most recent 5 nodes** are silently preloaded; it stops as soon as it
+  has enough
+- The sweep never changes where the user is looking (if they were pinned to the
+  bottom, it re-pins to the bottom afterwards)
+- Whatever the user scrolls past manually is absorbed into the list — the heartbeat
+  scans the DOM every 400ms
+- Loaded **titles + positions** are written to `localStorage` (keys prefixed
+  `kimi-pocket.toc.`), so a refresh keeps the list without reloading anything
+
+### When the system pills multiply
+
+If a third or fourth system pill appears in `.dock-workbar`, the script turns that
+row into a **horizontally scrollable strip** (`overflow-x:auto` + `flex-wrap:nowrap`,
+scrollbar hidden) and reserves width for the capsule at the end:
+
+- `flex-wrap` needs `!important` — the app sets `wrap` and its stylesheet comes later
+  in the document, so without `!important` it wins and overflow stays at 0 (measured),
+  meaning no horizontal scrolling is ever produced
+- "History nodes" is `position:fixed` with `z-index:2147483002` (above `chat-dock`'s
+  100), so it **stays pinned to the top-right corner** — it never scrolls away and is
+  never covered by the system pills
+
+### An honest limitation
+
+Some nodes are **outside what the frontend can load** (older turns only render once
+the user manually scrolls up into them). So the behaviour is deliberately un-clever:
+
+- **Found** → glide over, centre it, flash briefly
+- **Not found** → do not move the page, show a short notice saying the node is not
+  loaded yet and to scroll up first
+
+It never pretends to succeed and never jumps somewhere random.
+
+### Configuration
+
+```bash
+POCKET_TOC=0     # disable history nodes; index.html returns exactly as upstream (default 1)
+```
+
+### It steps aside automatically
+
+Above 640px the official rail renders itself. The injected capsule detects a visible
 ## Large responses (screenshots only — text is never touched)
 
 ### The symptom

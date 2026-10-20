@@ -170,6 +170,16 @@ export function loadConfig(env = process.env) {
     },
 
     rateLimitPerMin: toInt('POCKET_RATE_LIMIT', env.POCKET_RATE_LIMIT, 600, { min: 0, max: 100000 }),
+
+    // ---- 轮次导航胶囊 ------------------------------------------------------
+    // 桌面端右侧有「对话目录」，手机上没有 —— 不是没数据，是组件里写死了
+    // `!mobile`，而 mobile = `(max-width: 640px)`。这里在 HTML 里注入一小段
+    // 脚本，用官方自己的 data-turn-id 画一个胶囊贴在输入框右上角。
+    // 关掉它：POCKET_TOC=0
+    turnNav: {
+      enabled: toBool('POCKET_TOC', env.POCKET_TOC, true),
+    },
+
     // 默认 180 秒：60 秒实测太紧——扫码、过 Access 登录、再点确认，
     // 手慢一点就过期了。3 分钟是"够用但又不敢放着不管"的长度。
     pairTtlMs: toInt('POCKET_PAIR_TTL_SEC', env.POCKET_PAIR_TTL_SEC, 180, { min: 30, max: 3600 }) * 1000,

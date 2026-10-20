@@ -1,6 +1,6 @@
 {
   "name": "kimicode-pocket",
-  "version": "1.5.1",
+  "version": "1.6.11",
   "description": "Expose Kimi Code Desktop's web UI to your phone with a fixed-port reverse proxy: dynamic port discovery, Host/Origin rewrite, WebSocket passthrough, optional PIN, one-time pairing links and local QR codes. Zero runtime dependencies.",
   "type": "module",
   "bin": {
@@ -10,7 +10,7 @@
     "start": "node src/proxy.mjs",
     "pair": "node src/proxy.mjs --pair-only",
     "test": "node --test",
-    "check": "node --check src/proxy.mjs && node --check src/lib/config.mjs && node --check src/lib/args.mjs && node --check src/lib/discovery.mjs && node --check src/lib/rewrite.mjs && node --check src/lib/auth.mjs && node --check src/lib/pages.mjs && node --check src/lib/qr.mjs && node --check src/lib/pairwatch.mjs && node --check src/lib/trim.mjs && node --check src/lib/image.mjs && node --check src/lib/image-async.mjs && node --check src/lib/image-worker.mjs",
+    "check": "node --check src/proxy.mjs && node --check src/lib/config.mjs && node --check src/lib/args.mjs && node --check src/lib/discovery.mjs && node --check src/lib/rewrite.mjs && node --check src/lib/auth.mjs && node --check src/lib/pages.mjs && node --check src/lib/qr.mjs && node --check src/lib/pairwatch.mjs && node --check src/lib/trim.mjs && node --check src/lib/image.mjs && node --check src/lib/image-async.mjs && node --check src/lib/image-worker.mjs && node --check src/lib/toc.mjs",
     "tunnel": "node scripts/launch.mjs tunnel",
     "tunnel-service": "node scripts/launch.mjs tunnel-service",
     "watchdog": "node scripts/launch.mjs watchdog",

@@ -10,7 +10,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import zlib from 'node:zlib';
 import { spawn } from 'node:child_process';
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, mkdirSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -149,7 +149,9 @@ function startFakeDesktop() {
         return;
       }
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-      res.end('<!doctype html><title>Kimi Code</title>');
+      // 结构要和真实 Desktop 的 index.html 一致（有 </body>），
+      // 否则注入会退到「末尾追加」分支，测不到主路径。
+      res.end('<!doctype html><html><head><title>Kimi Code</title></head><body><div id="app"></div></body></html>');
     });
 
     server.on('upgrade', (req, socket) => {
@@ -163,7 +165,7 @@ function startFakeDesktop() {
 }
 
 /** 起一个真 proxy 实例，指向给定假 Desktop */
-async function startProxy({ desktopPort, pin, noToken = false } = {}) {
+async function startProxy({ desktopPort, pin, noToken = false, env: extraEnv = {} } = {}) {
   const home = mkdtempSync(join(tmpdir(), 'pocket-e2e-'));
   mkdirSync(join(home, 'server', 'instances'), { recursive: true });
   writeFileSync(
@@ -182,6 +184,7 @@ async function startProxy({ desktopPort, pin, noToken = false } = {}) {
     POCKET_ACCESS_LOG: '0',
     POCKET_RATE_LIMIT: '0',
   });
+  Object.assign(env, extraEnv);
   if (pin) env.POCKET_PIN = pin;
 
   const proc = spawn(process.execPath, [PROXY], { env, stdio: 'ignore' });
@@ -555,9 +558,91 @@ test('瘦身：带截图的会话 200 且标记 trimmed，文字不变', async (
   const body = await r.json();
   assert.ok(Array.isArray(body.data.items));
   const url = body.data.items[0].frames[0].output[0].imageUrl.url;
-  assert.match(url, /^data:image\/png;base64,/);
+  // 1.6.9 起输出 JPEG：PNG 对截图几乎压不动，实测 JPEG 能省 80%
+  assert.match(url, /^data:image\/jpeg;base64,/);
 
   // 降采样后应明显小于原图（1600x1000 → 533x333 左右）
   const outLen = Buffer.from(url.split(',')[1], 'base64').length;
   assert.ok(outLen < 900_000, `压缩后应明显变小，实际 ${outLen}`);
+});
+
+test('传输中断必须可观测（否则「HTTP 200 但 Failed to fetch」永远查不出来）', async () => {
+  // 用户实测报过：手机上 HTTP 200、2063ms、失败阶段 parse、TypeError: Failed to fetch。
+  // 而代理日志写着 `200 ... 13384621B`，看起来一切正常 —— 因为
+  // res 的 finish 事件只表示「交给内核缓冲区」，不代表对端收到。
+  // 查下来是他手机传输途中换了出口 IP（157.61.160.31 → 111.55.210.62），
+  // TCP 连接直接失效。这个盲区必须补，否则下次还是查不出来。
+  //
+  // 两个独立信号：
+  //   非压缩路径 —— 分块写 + writableFinished
+  //   压缩路径   —— socket 的 ECONNRESET（writableFinished 在那儿不可靠）
+  const src = readFileSync(new URL('../src/proxy.mjs', import.meta.url), 'utf8');
+  assert.ok(/function writeChunked\(/.test(src), '非压缩路径必须分块写');
+  assert.ok(src.includes('res.once(\'drain\', pump)'), '要等背压，否则几毫秒灌完缓冲区');
+  assert.ok(/function reportDelivery\(/.test(src), '要有完成度判定');
+  assert.ok(/function watchCompressedDelivery\(/.test(src), '压缩路径要单独观测');
+  assert.ok(src.includes("sock.on('error', onErr)"), '压缩路径要靠 socket error 判定');
+  assert.ok(src.includes('writableFinished'), '要能区分正常写完与中断');
+});
+
+// ---------------------------------------------------------------- 轮次导航
+//
+// 这一组防的是「手机上应该有却没有」：
+// 桌面端右侧有「对话目录」，但组件里写死 `!mobile`，而 mobile 就是
+// `(max-width: 640px)` —— 手机上一律不渲染。代理在 HTML 里注入一段脚本
+// 自己画胶囊。注入本身必须满足：只碰 HTML、不碰 JSON、可一键关闭。
+
+test('轮次导航：HTML 首页被注入，且 content-length 与实际字节一致', async () => {
+  const r = await fetch(`${proxy.base}/`);
+  assert.equal(r.status, 200);
+  assert.match(r.headers.get('content-type') ?? '', /text\/html/);
+
+  const html = await r.text();
+  assert.match(html, /kimi-pocket:turn-nav/, '注入标记必须在');
+  assert.match(html, /id="pocket-turn-nav-script"/, '脚本标签必须在');
+
+  // 注入后仍要保留原始文档结构（不能把 </body> 弄丢，也不能把 #app 吞掉）
+  assert.match(html, /<div id="app"><\/div>/);
+  assert.ok(html.includes('</body>'), '</body> 必须还在');
+  assert.ok(html.indexOf('kimi-pocket:turn-nav') < html.indexOf('</body>'), '必须插在 </body> 之前');
+  assert.equal(r.headers.get('content-length'), String(Buffer.byteLength(html)));
+});
+
+test('轮次导航：脚本只出现一次（重复注入会叠加两份监听）', async () => {
+  const html = await (await fetch(`${proxy.base}/`)).text();
+  const hits = html.match(/id="pocket-turn-nav-script"/g) ?? [];
+  assert.equal(hits.length, 1);
+});
+
+test('轮次导航：JSON 响应绝不能被注入', async () => {
+  const r = await fetch(`${proxy.base}/api/v1/sessions/plain/transcript?agent_id=main`);
+  assert.equal(r.status, 200);
+  const text = await r.text();
+  assert.ok(!text.includes('pocket-turn-nav'), 'JSON 里出现注入标记说明改坏了数据');
+  // 且仍然是合法 JSON
+  assert.doesNotThrow(() => JSON.parse(text));
+});
+
+test('轮次导航：POCKET_TOC=0 时首页原样返回，一个字节都不多', async () => {
+  const p = await startProxy({ desktopPort: fake.port, env: { POCKET_TOC: '0' } });
+  try {
+    const r = await fetch(`${p.base}/`);
+    assert.equal(r.status, 200);
+    const html = await r.text();
+    assert.ok(!html.includes('pocket-turn-nav'), 'POCKET_TOC=0 必须彻底关闭');
+    assert.match(html, /<title>Kimi Code<\/title>/);
+  } finally {
+    p.stop();
+  }
+});
+
+test('轮次导航：注入脚本语法合法（正则转义写错会整页白屏）', async () => {
+  const html = await (await fetch(`${proxy.base}/`)).text();
+  const start = html.indexOf('<script id="pocket-turn-nav-script">');
+  const codeStart = start + '<script id="pocket-turn-nav-script">'.length;
+  const code = html.slice(codeStart, html.indexOf('</script>', codeStart));
+  assert.ok(code.length > 500, '脚本不该是空的');
+  assert.doesNotThrow(() => new Function(code), '注入的脚本必须能被解析');
+  // 结束标签必须被转义掉，否则 HTML 提前闭合、后面的 DOM 全变文本
+  assert.ok(!/<\/script/i.test(code), '脚本体内不能出现未转义的 </script');
 });
